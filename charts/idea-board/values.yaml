@@ -190,9 +190,11 @@ ingress:
   enabled: true
   className: nginx
   host: idea-board.example.com
+  # cert-manager ClusterIssuer; the cluster-issuer + ssl-redirect annotations are
+  # emitted by templates/ingress.yaml ONLY when host + TLS are set (so an
+  # HTTP-only catch-all on the LB hostname isn't broken by an https redirect).
+  clusterIssuer: letsencrypt
   annotations:
-    cert-manager.io/cluster-issuer: letsencrypt
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
     nginx.ingress.kubernetes.io/proxy-body-size: "16m"
   tls:
     enabled: true

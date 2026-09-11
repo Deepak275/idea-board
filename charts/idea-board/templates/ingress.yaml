@@ -8,20 +8,29 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "idea-board.labels" . | nindent 4 }}
-  {{- with .Values.ingress.annotations }}
   annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.host }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.clusterIssuer | quote }}
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
-  {{- end }}
+    {{- end }}
 spec:
   ingressClassName: {{ .Values.ingress.className }}
-  {{- if .Values.ingress.tls.enabled }}
+  {{- if and .Values.ingress.tls.enabled .Values.ingress.host }}
   tls:
     - hosts:
         - {{ .Values.ingress.host | quote }}
       secretName: {{ $tlsSecret | quote }}
   {{- end }}
   rules:
-    - host: {{ .Values.ingress.host | quote }}
+      # An empty host makes this a catch-all rule: the load balancer's own
+      # hostname serves the app (public URL with no domain purchase). Set
+      # ingress.host to pin a real domain (and enable TLS).
+    - {{- if .Values.ingress.host }}
+      host: {{ .Values.ingress.host | quote }}
+      {{- end }}
       http:
         paths:
           # More-specific "/api" prefix is matched before "/" by ingress-nginx.
