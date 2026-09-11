@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Idea Board - share and browse ideas." />
+    <title>Idea Board</title>
+    <!--
+      Runtime-configurable environment. This file ships with the image and is
+      overwritten at container startup from $VITE_API_BASE_URL (see nginx
+      entrypoint). Loaded before the app bundle so window.__ENV__ is available
+      by the time src/api.ts resolves the API base URL.
+    -->
+    <script src="/env-config.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

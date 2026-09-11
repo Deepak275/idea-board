@@ -1,0 +1,15 @@
+# Ruff config for the Python backend + AI tooling.
+# Uses Ruff's default rule set, with a few deliberate, documented allowances.
+
+[lint.flake8-bugbear]
+# Depends() in argument defaults is the idiomatic FastAPI dependency-injection
+# pattern, not a bug — treat it as an immutable call.
+extend-immutable-calls = ["fastapi.Depends"]
+
+[lint.per-file-ignores]
+# The AI CLIs intentionally catch-all around external LLM/network/SDK calls and
+# fail closed (exit non-zero) — a broad except is correct here.
+"ai/**" = ["BLE001"]
+# The test suite deliberately uses a persistent NamedTemporaryFile (delete=False)
+# as the SQLite test database for the whole session.
+"app/backend/tests/**" = ["SIM115"]
