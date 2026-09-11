@@ -1,0 +1,39 @@
+idea-board has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Components:
+  backend  : {{ include "idea-board.backend.image" . }}  (Deployment "{{ include "idea-board.backend.fullname" . }}", Service :{{ .Values.backend.service.port }})
+  frontend : {{ include "idea-board.frontend.image" . }}  (Deployment "{{ include "idea-board.frontend.fullname" . }}", Service :{{ .Values.frontend.service.port }})
+
+Database:
+  DATABASE_URL is delivered by the External Secrets Operator from ClusterSecretStore
+  "{{ .Values.externalSecret.secretStoreRef.name }}" (remote key "{{ .Values.externalSecret.remoteKey }}") into Secret "{{ .Values.database.secretName }}".
+  The schema was migrated by the pre-install/pre-upgrade Job "{{ include "idea-board.fullname" . }}-migrate" ("alembic upgrade head").
+
+{{- if .Values.ingress.enabled }}
+
+Access:
+  {{ if .Values.ingress.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.host }}/            (frontend)
+  {{ if .Values.ingress.tls.enabled }}https{{ else }}http{{ end }}://{{ .Values.ingress.host }}/api/ideas   (backend API)
+
+  TLS is issued by cert-manager via the "letsencrypt" ClusterIssuer. Point a DNS
+  record for {{ .Values.ingress.host }} at the ingress-nginx LoadBalancer address:
+
+    kubectl get svc -n ingress-nginx
+{{- else }}
+
+Ingress is disabled. Reach the services via port-forward:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "idea-board.frontend.fullname" . }} 8080:{{ .Values.frontend.service.port }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "idea-board.backend.fullname" . }} 8000:{{ .Values.backend.service.port }}
+{{- end }}
+
+{{- if .Values.hpa.enabled }}
+
+Autoscaling:
+  The backend scales between {{ .Values.hpa.min }} and {{ .Values.hpa.max }} replicas (HPA "{{ include "idea-board.backend.fullname" . }}").
+  Ensure metrics-server is installed so the HPA can read CPU/memory.
+{{- end }}
+
+Check rollout status:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "idea-board.backend.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "idea-board.frontend.fullname" . }}

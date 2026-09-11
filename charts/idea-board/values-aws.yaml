@@ -1,0 +1,29 @@
+# ---------------------------------------------------------------------------
+# AWS overlay for the idea-board chart.
+#
+# Applied on top of values.yaml:
+#     helm upgrade --install idea-board charts/idea-board \
+#         -f values.yaml -f values-aws.yaml
+#
+# CONTRACT: this overlay differs from values.yaml (and from values-gcp.yaml) in
+# ONLY two dimensions — the storageClass and cloud LoadBalancer annotations.
+# Everything else is inherited from values.yaml. Do not add app logic here.
+# ---------------------------------------------------------------------------
+
+# EBS gp3 is the sensible default StorageClass on EKS.
+storageClass: gp3
+
+# Cloud LoadBalancer annotations. The public LB is the ingress-nginx controller
+# Service (installed by the platform layer); these annotations are surfaced here
+# so that if a component Service is switched to type: LoadBalancer it provisions
+# an AWS NLB with the right settings. They are inert while the Services are the
+# default ClusterIP + Ingress topology.
+backend:
+  service:
+    annotations: {}
+frontend:
+  service:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-type: external
+      service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing

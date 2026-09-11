@@ -1,0 +1,232 @@
+# ---------------------------------------------------------------------------
+# idea-board — base values (cloud-agnostic).
+#
+# This file is applied FIRST, then a cloud overlay on top:
+#     helm upgrade --install idea-board charts/idea-board \
+#         -f values.yaml -f values-<cloud>.yaml
+#
+# The overlays (values-aws.yaml / values-gcp.yaml) differ from this file in
+# ONLY two dimensions: storageClass and cloud LoadBalancer annotations. Every
+# other setting lives here and is identical across clouds.
+#
+# OWNER / TAG in the image repositories below are placeholders substituted by
+# CI (GHCR org + built image tag). Terraform/CI can also override image
+# coordinates and the ingress host at deploy time via --set.
+# ---------------------------------------------------------------------------
+
+# Optional name overrides. Left empty so names derive from the release name.
+nameOverride: ""
+fullnameOverride: ""
+
+# Extra image pull secrets (e.g. a GHCR pull token) applied to every workload.
+imagePullSecrets: []
+# - name: ghcr-pull
+
+serviceAccount:
+  # Create a dedicated ServiceAccount for the workloads.
+  create: true
+  # Name to use. Empty -> derived from the fullname ("idea-board").
+  name: ""
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Default container resources. Applied to BOTH the backend and frontend
+# containers unless a component overrides it via backend.resources /
+# frontend.resources. Kept modest so the app schedules on small nodes.
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# ---------------------------------------------------------------------------
+# Database wiring. The backend never sees raw credentials in the chart: the
+# DATABASE_URL is delivered through a K8s Secret that the External Secrets
+# Operator materialises from the cloud secret store (see externalSecret below).
+# ---------------------------------------------------------------------------
+database:
+  # Name of BOTH the ExternalSecret and the K8s Secret it produces
+  # (contract-mandated: "idea-board-db"). The backend reads DATABASE_URL from it.
+  secretName: idea-board-db
+  # Key inside the Secret holding the SQLAlchemy connection string
+  # (form: postgresql+psycopg://USER:PASS@HOST:PORT/DBNAME).
+  secretKey: DATABASE_URL
+
+# ---------------------------------------------------------------------------
+# External Secrets Operator: pulls the DATABASE_URL from the ClusterSecretStore
+# "cloud-secrets" (installed by the portable platform layer) at the logical
+# remote key "idea-board/db", and writes it into the Secret named above.
+# ---------------------------------------------------------------------------
+externalSecret:
+  enabled: true
+  # ClusterSecretStore created by the platform layer; provider (AWS Secrets
+  # Manager / GCP Secret Manager) is chosen there — identical name on both.
+  secretStoreRef:
+    name: cloud-secrets
+    kind: ClusterSecretStore
+  # How often ESO re-reads the remote value.
+  refreshInterval: 1h
+  # Logical remote key in the cloud secret store (db_secret_ref points here).
+  remoteKey: idea-board/db
+  # JSON property within the remote secret that holds the full DATABASE_URL.
+  # Set to "" if the remote secret is stored as a bare string instead of JSON.
+  remoteProperty: DATABASE_URL
+  # ESO lifecycle for the target Secret. "Orphan" means the derived Secret is
+  # NOT owner-referenced by the ExternalSecret, so it is never garbage-collected
+  # when the ExternalSecret is (re)created as a Helm hook (see externalsecret-db.yaml).
+  creationPolicy: Orphan
+  deletionPolicy: Retain
+
+# ---------------------------------------------------------------------------
+# Backend (FastAPI, :8000).
+# ---------------------------------------------------------------------------
+backend:
+  image:
+    repository: ghcr.io/OWNER/idea-board-backend
+    # Empty -> falls back to Chart.appVersion. CI/Terraform override this.
+    tag: ""
+    pullPolicy: IfNotPresent
+  replicas: 2
+  # Comma-separated CORS origins. Empty -> derived from ingress.host
+  # (the frontend is served from the same host, so this is that origin).
+  corsOrigins: ""
+  service:
+    type: ClusterIP
+    port: 8000
+    annotations: {}
+  # Extra environment variables for the backend container.
+  extraEnv: []
+  # Per-component resource override (empty -> inherits top-level .resources).
+  resources: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop:
+        - ALL
+  # Probe tuning. Liveness -> /healthz (no DB); readiness -> /readyz (checks DB).
+  livenessProbe:
+    initialDelaySeconds: 10
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readinessProbe:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# Frontend (React + Vite build served by nginx, :80).
+# ---------------------------------------------------------------------------
+frontend:
+  image:
+    repository: ghcr.io/OWNER/idea-board-frontend
+    tag: ""
+    pullPolicy: IfNotPresent
+  replicas: 2
+  # Browser-facing API base URL injected at container start (VITE_API_BASE_URL).
+  # Empty -> derived from ingress.host. The browser calls "<base>/api/ideas".
+  apiBaseUrl: ""
+  service:
+    type: ClusterIP
+    port: 80
+    annotations: {}
+  extraEnv: []
+  resources: {}
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    # 101 == the "nginx" user baked into the frontend image.
+    runAsUser: 101
+    runAsGroup: 101
+    fsGroup: 101
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      # nginx binds :80 as non-root via file capabilities (setcap in the image);
+      # NET_BIND_SERVICE must survive the "drop ALL" for that to work.
+      add:
+        - NET_BIND_SERVICE
+      drop:
+        - ALL
+  livenessProbe:
+    initialDelaySeconds: 5
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readinessProbe:
+    initialDelaySeconds: 3
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# Ingress (single host, path-routed). cert-manager issues the TLS cert via the
+# "letsencrypt" ClusterIssuer created by the platform layer.
+#   /api -> backend service   |   /  -> frontend service
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  host: idea-board.example.com
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+  tls:
+    enabled: true
+    # Empty -> derived as "<fullname>-tls".
+    secretName: ""
+
+# ---------------------------------------------------------------------------
+# Horizontal Pod Autoscaler for the backend. When enabled, the backend
+# Deployment omits a static replica count so the HPA owns scaling.
+# ---------------------------------------------------------------------------
+hpa:
+  enabled: true
+  min: 2
+  max: 6
+  targetCPUUtilizationPercentage: 70
+  # Optional memory target (set to null to disable the memory metric).
+  targetMemoryUtilizationPercentage: 80
+
+# ---------------------------------------------------------------------------
+# Database schema migration Job (Helm pre-install/pre-upgrade hook). Runs
+# "alembic upgrade head" using the backend image, after an init container has
+# waited for the database to become reachable.
+# ---------------------------------------------------------------------------
+migration:
+  enabled: true
+  backoffLimit: 3
+  # Seconds the init container waits for the DB before giving up.
+  waitTimeoutSeconds: 120
+  resources: {}
+
+# ---------------------------------------------------------------------------
+# storageClass — cloud-specific and set ONLY in the overlays. The application
+# itself is stateless (Postgres is external), so this is currently unused by
+# any PVC in the chart; it is surfaced for parity with the overlay contract and
+# for any future stateful component.
+# ---------------------------------------------------------------------------
+storageClass: ""

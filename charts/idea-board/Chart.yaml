@@ -1,0 +1,30 @@
+apiVersion: v2
+name: idea-board
+description: >-
+  A cloud-agnostic "Idea Board" application: a FastAPI backend, a React/Vite
+  frontend served by nginx, and a Postgres database provisioned out-of-band by
+  the cloud infrastructure layer. The chart is identical across clouds; only the
+  values-<cloud>.yaml overlay (storageClass + LoadBalancer annotations) differs.
+type: application
+
+# Chart version — bumped on chart changes.
+version: 1.0.0
+
+# The application version this chart deploys. Used as the default image tag
+# when backend.image.tag / frontend.image.tag are left empty. CI overrides the
+# concrete image coordinates at deploy time.
+appVersion: "1.0.0"
+
+home: https://github.com/OWNER/idea-board
+sources:
+  - https://github.com/OWNER/idea-board
+
+maintainers:
+  - name: idea-board maintainers
+
+keywords:
+  - fastapi
+  - react
+  - postgres
+  - cloud-agnostic
+  - external-secrets
