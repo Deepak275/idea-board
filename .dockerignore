@@ -1,0 +1,65 @@
+# Keep build contexts small and reproducible. Applies to any build that uses
+# the repo root as its context; per-service contexts (app/backend, app/frontend)
+# carry their own .dockerignore as well.
+
+# VCS / CI
+.git
+.gitignore
+.github
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+kubeconfig
+kubeconfig*
+*.kubeconfig
+.kube/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Node / frontend
+node_modules/
+dist/
+dist-ssr/
+.vite/
+.cache/
+coverage/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!*.tfvars.example
+
+# Docs / infra not needed inside images
+docs/
+infra/
+charts/
+scripts/
+README.md
+Makefile
+docker-compose.yml
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

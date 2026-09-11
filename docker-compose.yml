@@ -1,0 +1,88 @@
+# Idea Board — local development stack.
+#
+# Brings up the full app the same way it runs in production, minus the cloud:
+#   db       -> Postgres 16 (the same engine RDS / Cloud SQL provide in prod)
+#   backend  -> FastAPI (runs Alembic migrations, then uvicorn on :8000)
+#   frontend -> React/Vite build served by nginx on :80 (published on :5173)
+#
+# The app itself is 12-factor and cloud-agnostic: it reads DATABASE_URL from the
+# environment and knows nothing about compose, Kubernetes, or any cloud.
+#
+# Usage:
+#   cp .env.example .env      # optional; sane defaults are baked in below
+#   docker compose up --build
+#
+# Then open http://localhost:5173  (API at http://localhost:8000).
+
+services:
+  db:
+    image: postgres:16
+    container_name: idea-board-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ideas}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ideas}
+      POSTGRES_DB: ${POSTGRES_DB:-ideas}
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      # backend depends_on this being *healthy*, so migrations never race the DB.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ideas} -d ${POSTGRES_DB:-ideas}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./app/backend
+    image: idea-board-backend:local
+    container_name: idea-board-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Contract form: postgresql+psycopg://USER:PASS@HOST:PORT/DBNAME
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://ideas:ideas@db:5432/ideas}
+      # Origin(s) the API allows via CORS — the frontend published below.
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+    # Apply schema migrations, then start the API server. In production the
+    # migration step runs as a separate Helm pre-install/upgrade Job instead.
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      # Liveness probe hits /healthz (no DB). python is guaranteed in the image.
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)\""
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./app/frontend
+      args:
+        # Vite inlines env at *build* time, so the API base URL is a build arg.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    image: idea-board-frontend:local
+    container_name: idea-board-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      # Also exposed at runtime for setups that read it dynamically.
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "5173:80"
+
+volumes:
+  db-data:
+    driver: local
