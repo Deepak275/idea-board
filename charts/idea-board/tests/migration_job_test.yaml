@@ -1,0 +1,22 @@
+suite: migration job hook
+templates:
+  - templates/migration-job.yaml
+tests:
+  - it: is a Job wired as a pre-install/pre-upgrade Helm hook
+    set:
+      backend.image.tag: test
+    asserts:
+      - isKind:
+          of: Job
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: pre-install,pre-upgrade
+
+  - it: runs the alembic migration from the backend image
+    set:
+      backend.image.repository: example.com/idea-board-backend
+      backend.image.tag: v9
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value: ["alembic", "upgrade", "head"]
