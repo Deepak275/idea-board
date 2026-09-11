@@ -120,6 +120,62 @@ jobs:
           cache-from: type=gha,scope=frontend
           cache-to: type=gha,mode=max,scope=frontend
 
+      - name: Trivy image scan (report)
+        continue-on-error: true
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          for img in "${{ steps.meta.outputs.backend_image }}:${{ steps.meta.outputs.tag }}" \
+                     "${{ steps.meta.outputs.frontend_image }}:${{ steps.meta.outputs.tag }}"; do
+            echo "== scanning $img =="
+            trivy image --severity HIGH,CRITICAL --ignore-unfixed --no-progress "$img" || true
+          done
+
+  # ---------------------------------------------------------------------------
+  # Pre-deploy GATE: run the same quality checks as CI so a broken commit never
+  # deploys. The deploy job `needs:` this.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify (lint + tests + tf + helm) — gate before deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - name: Backend lint + tests
+        run: |
+          pip install -r app/backend/requirements-dev.txt ruff
+          python -m ruff check app/backend ai
+          ( cd app/backend && python -m pytest -q )
+      - name: Terraform fmt + validate + unit tests + contract
+        run: |
+          set -e
+          terraform fmt -check -recursive infra
+          for d in infra/stacks/aws infra/stacks/gcp infra/platform; do
+            terraform -chdir="$d" init -backend=false -input=false >/dev/null
+            terraform -chdir="$d" validate
+          done
+          for d in infra/modules/aws/cluster infra/modules/aws/database infra/modules/gcp/cluster infra/modules/gcp/database; do
+            terraform -chdir="$d" init -backend=false -input=false >/dev/null
+            terraform -chdir="$d" test
+          done
+          bash infra/tests/contract_parity.sh
+      - name: Helm lint + unittest
+        run: |
+          set -e
+          for c in aws gcp; do
+            helm lint charts/idea-board -f charts/idea-board/values.yaml -f charts/idea-board/values-$c.yaml
+          done
+          helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false
+          helm unittest charts/idea-board
+
   # ---------------------------------------------------------------------------
   # Turn the inputs into a matrix: ["aws"] | ["gcp"] | ["aws","gcp"].
   # ---------------------------------------------------------------------------
@@ -143,7 +199,7 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy (${{ matrix.cloud }})
-    needs: [build, matrix]
+    needs: [verify, build, matrix]
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment }}
     permissions:
@@ -352,6 +408,37 @@ jobs:
           echo "hc_code=$code" >> "$GITHUB_OUTPUT"
           echo "health-check exit code: $code"
 
+      # ---- 5b) Post-deploy link/smoke check: does the PUBLIC URL return 200? -
+      - name: Post-deploy link check
+        id: linkcheck
+        continue-on-error: true
+        run: |
+          set +e
+          # The ingress matches on a specific Host (spec.rules[0].host). To smoke-
+          # test without owning DNS, we present that Host header but --connect-to
+          # the load balancer's own address — so this verifies real ingress path
+          # routing whether or not INGRESS_HOST is a resolvable domain.
+          ING_HOST=$(kubectl -n "$NAMESPACE" get ingress -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null)
+          link_ok=1 LB=""
+          for i in $(seq 1 12); do
+            [ -z "$LB" ] && LB=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+            [ -z "$LB" ] && LB=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+            if [ -n "$LB" ] && [ -n "$ING_HOST" ]; then
+              api=$(curl -s -o /dev/null -w '%{http_code}' --connect-to "${ING_HOST}:80:${LB}:80" "http://${ING_HOST}/api/ideas")
+              root=$(curl -s -o /dev/null -w '%{http_code}' --connect-to "${ING_HOST}:80:${LB}:80" "http://${ING_HOST}/")
+              echo "attempt $i (LB=$LB host=$ING_HOST): /api/ideas=$api  /=$root"
+              { [ "$api" = "200" ] && [ "$root" = "200" ]; } && { link_ok=0; break; }
+            else
+              echo "attempt $i: waiting for ingress host/LB (host='${ING_HOST}' lb='${LB}')"
+            fi
+            sleep 15
+          done
+          echo "link_ok=$link_ok" >> "$GITHUB_OUTPUT"
+          echo "app_host=$ING_HOST" >> "$GITHUB_OUTPUT"
+          echo "lb_addr=$LB" >> "$GITHUB_OUTPUT"
+
       # ---- 6) Decide: keep, or roll back + summarise ------------------------
       - name: Gate — keep or roll back the release
         if: always()
@@ -360,9 +447,11 @@ jobs:
           helm_outcome='${{ steps.helm.outcome }}'   # success | failure
           hc='${{ steps.health.outputs.hc_code }}'   # 0 healthy / 1 unhealthy / 2 error / '' if skipped
           hc="${hc:-2}"
+          lc='${{ steps.linkcheck.outputs.link_ok }}' # 0 = public URL returned 200 on /api/ideas
+          lc="${lc:-1}"
 
           verdict_ok=false
-          if [ "$helm_outcome" = "success" ] && [ "$hc" = "0" ]; then
+          if [ "$helm_outcome" = "success" ] && [ "$hc" = "0" ] && [ "$lc" = "0" ]; then
             verdict_ok=true
           fi
 
@@ -377,7 +466,11 @@ jobs:
             echo "| frontend image | \`${FRONTEND_IMAGE}:${TAG}\` |"
             echo "| helm upgrade | \`${helm_outcome}\` |"
             echo "| AI health-check exit | \`${hc}\` (0=healthy,1=unhealthy,2=inconclusive) |"
-            [ -n "${INGRESS_HOST}" ] && echo "| app URL | https://${INGRESS_HOST} |"
+            echo "| link check (/ + /api/ideas == 200?) | \`${lc}\` (0=ok) |"
+            APP_HOST='${{ steps.linkcheck.outputs.app_host }}'
+            LB_ADDR='${{ steps.linkcheck.outputs.lb_addr }}'
+            [ -n "${APP_HOST}" ] && echo "| ingress host | \`${APP_HOST}\` |"
+            [ -n "${LB_ADDR}" ] && echo "| load balancer | \`${LB_ADDR}\` (point a DNS record here, or set INGRESS_HOST) |"
             echo
             echo "## AI health-check output"
             echo '```'
@@ -390,7 +483,7 @@ jobs:
             exit 0
           fi
 
-          echo "::error::Deployment not verified healthy (helm=${helm_outcome}, health-check=${hc}); rolling back." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::error::Deployment not verified healthy (helm=${helm_outcome}, health-check=${hc}, link-check=${lc}); rolling back." | tee -a "$GITHUB_STEP_SUMMARY"
 
           # Roll back only if there is a prior revision; otherwise remove the
           # failed first install so the cluster is left clean.
