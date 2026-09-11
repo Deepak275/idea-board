@@ -1,0 +1,113 @@
+{{- if .Values.migration.enabled -}}
+# ---------------------------------------------------------------------------
+# Database schema migration Job (Helm hook).
+#
+# Runs "alembic upgrade head" from the backend image BEFORE the app is installed
+# or upgraded, so the new code never starts against an un-migrated schema.
+#
+# Hook ordering:
+#   weight -10  externalsecret-db  (materialises the DATABASE_URL Secret)
+#   weight   0  this migration Job (consumes that Secret)
+#
+# An init container first waits for the database to accept connections, so a
+# briefly-unavailable managed DB (RDS/Cloud SQL) does not burn the backoffLimit.
+# hook-delete-policy keeps a FAILED Job around for debugging but cleans up on
+# success and before any re-run.
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "idea-board.fullname" . }}-migrate
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "idea-board.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migration
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  # Give the whole migration a hard ceiling (wait + alembic).
+  activeDeadlineSeconds: {{ add .Values.migration.waitTimeoutSeconds 600 }}
+  template:
+    metadata:
+      labels:
+        {{- include "idea-board.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "idea-board.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backend.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: wait-for-db
+          image: {{ include "idea-board.backend.image" . | quote }}
+          imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
+          {{- with .Values.backend.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.secretName | quote }}
+                  key: {{ .Values.database.secretKey | quote }}
+            - name: DB_WAIT_TIMEOUT
+              value: {{ .Values.migration.waitTimeoutSeconds | quote }}
+          command: ["python", "-c"]
+          args:
+            - |
+              import os, sys, time
+              from sqlalchemy import create_engine, text
+              url = os.environ["DATABASE_URL"]
+              deadline = time.time() + float(os.environ.get("DB_WAIT_TIMEOUT", "120"))
+              while True:
+                  try:
+                      engine = create_engine(url, pool_pre_ping=True)
+                      with engine.connect() as conn:
+                          conn.execute(text("SELECT 1"))
+                      print("database is reachable")
+                      break
+                  except Exception as exc:  # noqa: BLE001
+                      if time.time() > deadline:
+                          print(f"timed out waiting for database: {exc}", file=sys.stderr)
+                          sys.exit(1)
+                      print(f"waiting for database: {exc}")
+                      time.sleep(3)
+          resources:
+            {{- toYaml (.Values.migration.resources | default (.Values.backend.resources | default .Values.resources)) | nindent 12 }}
+      containers:
+        - name: migrate
+          image: {{ include "idea-board.backend.image" . | quote }}
+          imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
+          {{- with .Values.backend.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          workingDir: /app
+          command: ["alembic", "upgrade", "head"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.secretName | quote }}
+                  key: {{ .Values.database.secretKey | quote }}
+          resources:
+            {{- toYaml (.Values.migration.resources | default (.Values.backend.resources | default .Values.resources)) | nindent 12 }}
+      {{- with .Values.backend.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.backend.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

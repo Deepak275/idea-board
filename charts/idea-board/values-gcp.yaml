@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# GCP overlay for the idea-board chart.
+#
+# Applied on top of values.yaml:
+#     helm upgrade --install idea-board charts/idea-board \
+#         -f values.yaml -f values-gcp.yaml
+#
+# CONTRACT: this overlay differs from values.yaml (and from values-aws.yaml) in
+# ONLY two dimensions — the storageClass and cloud LoadBalancer annotations.
+# Everything else is inherited from values.yaml. Do not add app logic here.
+# ---------------------------------------------------------------------------
+
+# The GKE balanced persistent-disk StorageClass.
+storageClass: standard-rwo
+
+# Cloud LoadBalancer annotations. The public LB is the ingress-nginx controller
+# Service (installed by the platform layer); these annotations are surfaced here
+# so that if a component Service is switched to type: LoadBalancer it provisions
+# a GCP LB with the right settings. They are inert while the Services are the
+# default ClusterIP + Ingress topology.
+backend:
+  service:
+    annotations: {}
+frontend:
+  service:
+    annotations:
+      cloud.google.com/l4-rbs: enabled
+      networking.gke.io/load-balancer-type: External

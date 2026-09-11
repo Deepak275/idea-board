@@ -1,0 +1,16 @@
+# Patterns to ignore when packaging the chart (helm package / helm install).
+.DS_Store
+.git/
+.gitignore
+*.tmp
+*.bak
+*.orig
+*.swp
+.idea/
+.vscode/
+*.tgz
+# Overlays are passed explicitly with -f; they are still shipped in the chart,
+# but editor/CI scratch files are not.
+*.log
+# Chart unit tests (helm-unittest) are dev-only; don't ship them in the package.
+tests/
