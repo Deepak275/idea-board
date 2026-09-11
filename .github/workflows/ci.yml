@@ -29,7 +29,7 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.12"
-  TF_VERSION: "1.9.5"
+  TF_VERSION: "1.16.1"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -122,6 +122,8 @@ jobs:
 
       - name: Set up Helm
         uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0 # pinned to match local; Helm 4 needs --verify=false for plugins
 
       - name: helm lint (aws + gcp overlays)
         run: |
