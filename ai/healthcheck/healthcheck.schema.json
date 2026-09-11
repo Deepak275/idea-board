@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idea-board/ai/healthcheck.schema.json",
+  "title": "HealthCheckVerdict",
+  "description": "The STRUCTURED verdict the LLM must return. This schema is the contract between the (non-deterministic) model and the (deterministic) CI gate. The model PROPOSES a verdict; this schema VALIDATES it; CI then deterministically decides whether to roll back based on the boolean `healthy` and the process exit code. Never let free-form model text drive the rollback decision.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["healthy", "confidence", "reasons", "summary"],
+  "properties": {
+    "healthy": {
+      "type": "boolean",
+      "description": "true only if the deployment appears healthy and safe to keep. This single boolean drives the CI rollback gate."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Model self-reported confidence in the verdict, 0.0 (no confidence) to 1.0 (certain)."
+    },
+    "reasons": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Concrete, evidence-backed bullet reasons for the verdict (cite pod names, restart counts, event messages, log lines)."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One-to-three sentence plain-English summary suitable for a CI job summary or PR comment."
+    }
+  }
+}

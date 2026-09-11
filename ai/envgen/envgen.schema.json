@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://idea-board/ai/envgen.schema.json",
+  "title": "EnvGenProposal",
+  "description": "A PROPOSED (not applied) sizing configuration for the idea-board platform. The LLM proposes values; this schema plus the hard guardrails in main.py validate them; a human then reviews the rendered tfvars / Helm-values snippet before anything is applied. The vocabulary is deliberately CONSTRAINED to the cloud-agnostic t-shirt sizes so the same proposal maps identically onto AWS (EKS/RDS) and GCP (GKE/Cloud SQL).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "node_size",
+    "node_count",
+    "backend_replicas",
+    "frontend_replicas",
+    "hpa_min",
+    "hpa_max"
+  ],
+  "properties": {
+    "node_size": {
+      "type": "string",
+      "enum": ["small", "medium", "large"],
+      "description": "Cloud-agnostic node t-shirt size. Each cloud module maps it to a concrete machine type (AWS: t3.medium/m5.large/m5.2xlarge; GCP: e2-medium/e2-standard-4/e2-standard-8)."
+    },
+    "node_count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "description": "Number of worker nodes in the cluster node pool."
+    },
+    "backend_replicas": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20,
+      "description": "Baseline replica count for the FastAPI backend Deployment (Helm key backend.replicas)."
+    },
+    "frontend_replicas": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20,
+      "description": "Baseline replica count for the nginx frontend Deployment (Helm key frontend.replicas)."
+    },
+    "hpa_min": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20,
+      "description": "Backend HorizontalPodAutoscaler minimum replicas (Helm key hpa.min)."
+    },
+    "hpa_max": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 50,
+      "description": "Backend HorizontalPodAutoscaler maximum replicas (Helm key hpa.max). Must be >= hpa_min."
+    }
+  }
+}

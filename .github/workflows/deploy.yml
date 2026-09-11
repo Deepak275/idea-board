@@ -1,0 +1,407 @@
+# =============================================================================
+# Deploy — build images, provision cloud infra, install the app, AI-gate it.
+#
+# Manually triggered (workflow_dispatch). Pick a cloud (aws|gcp) and an
+# environment; optionally fan out to BOTH clouds via a matrix.
+#
+# Flow (per cloud):
+#   build once ─► [matrix per cloud]
+#     1. terraform apply infra/stacks/<cloud>   (VPC + cluster + Postgres)
+#     2. scripts/get-kubeconfig.sh <cloud>       (the ONLY cloud auth shim)
+#     3. terraform apply infra/platform          (add-ons: ingress-nginx,
+#        cert-manager, external-secrets + ClusterSecretStore "cloud-secrets")
+#     4. helm upgrade --install idea-board       (-f values.yaml -f values-<cloud>.yaml,
+#        with the freshly built image tags; migration runs as a pre-upgrade Job)
+#     5. AI health-check (python ai/healthcheck) — Claude proposes a STRUCTURED
+#        verdict, ai/healthcheck VALIDATES it against a JSON Schema, and CI acts
+#        deterministically on the exit code.
+#     6. on unhealthy / failed rollout: `helm rollback` + post a summary.
+#
+# Security posture:
+#   * Cloud auth is OIDC only — NO long-lived cloud keys are stored.
+#   * The LLM never receives cloud credentials or Kubernetes Secrets; it only
+#     sees redacted kubectl text (see ai/healthcheck).
+#   * ANTHROPIC_API_KEY is the sole app secret consumed here.
+# =============================================================================
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: "Target cloud"
+        type: choice
+        options: [aws, gcp]
+        default: aws
+      environment:
+        description: "Deployment environment (maps to a GitHub Environment for protection rules)"
+        type: string
+        default: production
+      deploy_both:
+        description: "Deploy to BOTH clouds (matrix fan-out; ignores the 'cloud' input)"
+        type: boolean
+        default: false
+
+# Least privilege by default; jobs widen as needed.
+permissions:
+  contents: read
+
+concurrency:
+  # Never run two deploys of the same environment concurrently.
+  group: deploy-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  TF_VERSION: "1.9.5"
+  RELEASE: idea-board
+  NAMESPACE: idea-board
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build & push both images ONCE (they are cloud-independent). Deterministic
+  # tag = sha-<short>. GHCR paths use the lowercased owner (registry requires it).
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & push images (GHCR)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      owner: ${{ steps.meta.outputs.owner }}
+      backend_image: ${{ steps.meta.outputs.backend_image }}
+      frontend_image: ${{ steps.meta.outputs.frontend_image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image coordinates
+        id: meta
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          tag="sha-${GITHUB_SHA::7}"
+          {
+            echo "owner=$owner"
+            echo "tag=$tag"
+            echo "backend_image=${REGISTRY}/${owner}/idea-board-backend"
+            echo "frontend_image=${REGISTRY}/${owner}/idea-board-frontend"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: app/backend
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.backend_image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.backend_image }}:latest
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build & push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: app/frontend
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.frontend_image }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.frontend_image }}:latest
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+  # ---------------------------------------------------------------------------
+  # Turn the inputs into a matrix: ["aws"] | ["gcp"] | ["aws","gcp"].
+  # ---------------------------------------------------------------------------
+  matrix:
+    name: Resolve deploy matrix
+    runs-on: ubuntu-latest
+    outputs:
+      clouds: ${{ steps.mk.outputs.clouds }}
+    steps:
+      - id: mk
+        run: |
+          if [ "${{ github.event.inputs.deploy_both }}" = "true" ]; then
+            echo 'clouds=["aws","gcp"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "clouds=[\"${{ github.event.inputs.cloud }}\"]" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Deploy: one job per selected cloud. fail-fast=false so one cloud failing
+  # does not cancel the other.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy (${{ matrix.cloud }})
+    needs: [build, matrix]
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write # OIDC cloud auth (no static keys)
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        cloud: ${{ fromJSON(needs.matrix.outputs.clouds) }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CLOUD: ${{ matrix.cloud }}
+      TAG: ${{ needs.build.outputs.tag }}
+      BACKEND_IMAGE: ${{ needs.build.outputs.backend_image }}
+      FRONTEND_IMAGE: ${{ needs.build.outputs.frontend_image }}
+      # Where the app is reachable once deployed (also used in the run summary).
+      INGRESS_HOST: ${{ vars.INGRESS_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Install AI health-check dependencies
+        run: pip install -r ai/healthcheck/requirements.txt
+
+      # ---- Cloud authentication via OIDC ------------------------------------
+      - name: Authenticate to AWS (OIDC)
+        if: ${{ matrix.cloud == 'aws' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Authenticate to Google Cloud (OIDC / Workload Identity Federation)
+        if: ${{ matrix.cloud == 'gcp' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud + GKE auth plugin
+        if: ${{ matrix.cloud == 'gcp' }}
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      # ---- 1) Cloud stack: network + cluster + database ---------------------
+      # Region/project are passed as TF_VAR_* env: Terraform silently ignores an
+      # env var for a variable a stack doesn't declare, so the same block works
+      # for both the AWS stack (region) and the GCP stack (region + project).
+      - name: Terraform apply — cloud stack
+        env:
+          TF_VAR_cloud: ${{ matrix.cloud }}
+          TF_VAR_region: ${{ matrix.cloud == 'aws' && vars.AWS_REGION || vars.GCP_REGION }}
+          TF_VAR_project: ${{ vars.GCP_PROJECT }}
+        run: |
+          set -e
+          if [ "$CLOUD" = "aws" ]; then
+            terraform -chdir=infra/stacks/aws init -input=false \
+              -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+              -backend-config="key=idea-board/aws/terraform.tfstate" \
+              -backend-config="region=${{ vars.AWS_REGION }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+              -backend-config="encrypt=true"
+          else
+            terraform -chdir=infra/stacks/gcp init -input=false \
+              -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+              -backend-config="prefix=idea-board/gcp"
+          fi
+          terraform -chdir="infra/stacks/$CLOUD" apply -auto-approve -input=false
+
+      # ---- 2) Point kubeconfig at the new cluster (THE cloud auth shim) ------
+      - name: Get kubeconfig
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          chmod +x scripts/get-kubeconfig.sh
+          ./scripts/get-kubeconfig.sh "$CLOUD"
+
+      # ---- Mint a short-lived bearer token for the platform TF providers -----
+      # The portable platform layer authenticates purely from kube_host/
+      # kube_ca_cert/kube_token vars (no cloud SDK). We read host/CA from the
+      # stack outputs and mint the token with the cloud CLI here.
+      - name: Resolve cluster connection details
+        id: kube
+        run: |
+          set -e
+          CLUSTER=$(terraform -chdir="infra/stacks/$CLOUD" output -raw cluster_name)
+          REGION=$(terraform -chdir="infra/stacks/$CLOUD" output -raw region)
+          KUBE_HOST=$(terraform -chdir="infra/stacks/$CLOUD" output -raw kube_host)
+          KUBE_CA=$(terraform -chdir="infra/stacks/$CLOUD" output -raw kube_ca_cert)
+          if [ "$CLOUD" = "aws" ]; then
+            KUBE_TOKEN=$(aws eks get-token --cluster-name "$CLUSTER" --region "$REGION" | jq -r '.status.token')
+          else
+            KUBE_TOKEN=$(gcloud auth print-access-token)
+          fi
+          {
+            echo "CLUSTER=$CLUSTER"
+            echo "REGION=$REGION"
+            echo "KUBE_HOST=$KUBE_HOST"
+            echo "KUBE_CA=$KUBE_CA"
+          } >> "$GITHUB_ENV"
+          # Token is sensitive: mask it and pass via env, never echo it.
+          echo "::add-mask::$KUBE_TOKEN"
+          echo "KUBE_TOKEN=$KUBE_TOKEN" >> "$GITHUB_ENV"
+
+      # ---- 3) Portable platform layer: cluster ADD-ONS only -----------------
+      # We -target the add-ons and deliberately do NOT let Terraform install the
+      # app chart here: the app is owned by the explicit `helm upgrade` below so
+      # the AI gate can `helm rollback` a bad release cleanly. The app-chart
+      # resource in infra/platform is for the standalone/manual path.
+      - name: Terraform apply — platform add-ons
+        run: |
+          set -e
+          terraform -chdir=infra/platform init -input=false
+
+          # Cloud-conditional ESO wiring (the only per-cloud platform inputs).
+          extra_vars=()
+          if [ "$CLOUD" = "aws" ]; then
+            extra_vars+=( -var="aws_region=${REGION}" -var="aws_eso_role_arn=${{ vars.AWS_ESO_ROLE_ARN }}" )
+          else
+            extra_vars+=(
+              -var="gcp_project_id=${{ vars.GCP_PROJECT }}"
+              -var="gcp_location=${REGION}"
+              -var="gcp_cluster_name=${CLUSTER}"
+              -var="gcp_eso_service_account_email=${{ vars.GCP_ESO_SA_EMAIL }}"
+            )
+          fi
+
+          # Idempotency note: infra/platform has no remote backend defined (the
+          # contract only mandates remote state for the stacks), so CI state is
+          # ephemeral. A re-apply onto already-installed add-ons can report
+          # "release already exists"; we tolerate that and continue, because the
+          # downstream AI health-check is the real gate — if the ClusterSecretStore
+          # is genuinely missing, the app's ExternalSecret won't sync and the gate
+          # will roll the release back. In production, point this layer at a
+          # remote backend (see infra/platform/README.md).
+          terraform -chdir=infra/platform apply -auto-approve -input=false \
+            -target=terraform_data.input_guard \
+            -target=helm_release.ingress_nginx \
+            -target=helm_release.cert_manager \
+            -target=kubectl_manifest.letsencrypt_cluster_issuer \
+            -target=helm_release.external_secrets \
+            -target=kubectl_manifest.cloud_secrets_store \
+            -var="cloud=${CLOUD}" \
+            -var="kube_host=${KUBE_HOST}" \
+            -var="kube_ca_cert=${KUBE_CA}" \
+            -var="kube_token=${KUBE_TOKEN}" \
+            -var="letsencrypt_email=${{ vars.LETSENCRYPT_EMAIL }}" \
+            "${extra_vars[@]}" \
+          || echo "::warning::platform add-ons apply returned non-zero (add-ons may already exist); continuing — the AI health-check gates the result."
+
+      # ---- 4) Install/upgrade the app with the freshly built images ---------
+      - name: Helm upgrade --install idea-board
+        id: helm
+        continue-on-error: true # a failed rollout must reach the AI gate + rollback below
+        run: |
+          set -e
+          args=(
+            --namespace "$NAMESPACE" --create-namespace
+            -f charts/idea-board/values.yaml
+            -f "charts/idea-board/values-${CLOUD}.yaml"
+            --set "backend.image.repository=${BACKEND_IMAGE}"
+            --set "backend.image.tag=${TAG}"
+            --set "frontend.image.repository=${FRONTEND_IMAGE}"
+            --set "frontend.image.tag=${TAG}"
+          )
+          if [ -n "${INGRESS_HOST}" ]; then
+            args+=( --set "ingress.host=${INGRESS_HOST}" )
+          fi
+          helm upgrade --install "$RELEASE" charts/idea-board \
+            "${args[@]}" --wait --timeout 10m
+
+      # ---- 5) AI health-check gate ------------------------------------------
+      # Exit 0 healthy / 1 unhealthy / 2 inconclusive. We capture the code and
+      # act deterministically in the next step (fail closed on anything != 0).
+      - name: AI health-check
+        id: health
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set +e
+          python ai/healthcheck/main.py --namespace "$NAMESPACE" | tee healthcheck.out
+          code=${PIPESTATUS[0]}
+          echo "hc_code=$code" >> "$GITHUB_OUTPUT"
+          echo "health-check exit code: $code"
+
+      # ---- 6) Decide: keep, or roll back + summarise ------------------------
+      - name: Gate — keep or roll back the release
+        if: always()
+        run: |
+          set +e
+          helm_outcome='${{ steps.helm.outcome }}'   # success | failure
+          hc='${{ steps.health.outputs.hc_code }}'   # 0 healthy / 1 unhealthy / 2 error / '' if skipped
+          hc="${hc:-2}"
+
+          verdict_ok=false
+          if [ "$helm_outcome" = "success" ] && [ "$hc" = "0" ]; then
+            verdict_ok=true
+          fi
+
+          {
+            echo "# Deploy summary — ${CLOUD} / ${{ github.event.inputs.environment }}"
+            echo
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| cloud | \`${CLOUD}\` |"
+            echo "| release | \`${RELEASE}\` (ns \`${NAMESPACE}\`) |"
+            echo "| backend image | \`${BACKEND_IMAGE}:${TAG}\` |"
+            echo "| frontend image | \`${FRONTEND_IMAGE}:${TAG}\` |"
+            echo "| helm upgrade | \`${helm_outcome}\` |"
+            echo "| AI health-check exit | \`${hc}\` (0=healthy,1=unhealthy,2=inconclusive) |"
+            [ -n "${INGRESS_HOST}" ] && echo "| app URL | https://${INGRESS_HOST} |"
+            echo
+            echo "## AI health-check output"
+            echo '```'
+            cat healthcheck.out 2>/dev/null || echo "(no output captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$verdict_ok" = "true" ]; then
+            echo "✅ Deployment verified healthy — keeping release." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "::error::Deployment not verified healthy (helm=${helm_outcome}, health-check=${hc}); rolling back." | tee -a "$GITHUB_STEP_SUMMARY"
+
+          # Roll back only if there is a prior revision; otherwise remove the
+          # failed first install so the cluster is left clean.
+          revs=$(helm history "$RELEASE" -n "$NAMESPACE" -o json 2>/dev/null | jq 'length' 2>/dev/null || echo 0)
+          if [ "${revs:-0}" -gt 1 ]; then
+            echo "Rolling back \`${RELEASE}\` to the previous revision..." | tee -a "$GITHUB_STEP_SUMMARY"
+            helm rollback "$RELEASE" -n "$NAMESPACE" --wait --timeout 10m \
+              && echo "Rollback complete." | tee -a "$GITHUB_STEP_SUMMARY" \
+              || echo "::error::helm rollback failed — manual intervention required."
+          else
+            echo "No previous revision; uninstalling the failed release." | tee -a "$GITHUB_STEP_SUMMARY"
+            helm uninstall "$RELEASE" -n "$NAMESPACE" || true
+          fi
+
+          # Fail the job so the pipeline reflects the unhealthy deploy.
+          exit 1
