@@ -11,13 +11,13 @@ terraform {
     # Installs the platform add-ons and the idea-board app chart.
     helm = {
       source  = "hashicorp/helm"
-      version = "~> 2.13"
+      version = "~> 3.3"
     }
 
     # Used only for namespaces / lookups; app resources come from the Helm chart.
     kubernetes = {
       source  = "hashicorp/kubernetes"
-      version = "~> 2.27"
+      version = "~> 3.2"
     }
 
     # Applies the ClusterIssuer + ClusterSecretStore CRs. We use the kubectl
