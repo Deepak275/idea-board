@@ -27,12 +27,12 @@ human-approved before anything runs.
 ## Table of contents
 
 - [Architecture](#architecture)
-- [CI/CD pipelines](#cicd-pipelines)
 - [Run locally with Docker Compose](#run-locally-with-docker-compose)
+- [Cloud-Agnostic Approach](#cloud-agnostic-approach)
+- [CI/CD pipelines](#cicd-pipelines)
 - [Deploy to a cloud](#deploy-to-a-cloud)
 - [AI Integration](#ai-integration)
 - [Security: how we build and deploy safely](#security-how-we-build-and-deploy-safely)
-- [Cloud-Agnostic Approach](#cloud-agnostic-approach)
 - [Repository layout](#repository-layout)
 - [Further reading](#further-reading)
 
@@ -108,6 +108,221 @@ boundary — lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 
+## Run locally with Docker Compose
+
+You do **not** need any cloud account, Kubernetes, or Terraform to run the whole app
+locally. Docker Compose brings up Postgres, the backend (which runs the Alembic
+migration on start), and the frontend.
+
+**Prerequisites:** Docker Engine + the Docker Compose v2 plugin.
+
+```bash
+# 1. Clone and enter the repo
+git clone https://github.com/OWNER/idea-board.git
+cd idea-board
+
+# 2. (optional) copy the example env; the compose file already has sane defaults
+cp .env.example .env
+
+# 3. Build and start db + backend + frontend
+docker compose up --build
+```
+
+That's it. Compose wires the three services together using these exact values (from the
+shared contract — do not change them for local runs):
+
+| Service    | Port (host→container) | Key environment                                                        |
+|------------|-----------------------|------------------------------------------------------------------------|
+| `db`       | `5432 → 5432`         | `POSTGRES_USER=ideas`, `POSTGRES_PASSWORD=ideas`, `POSTGRES_DB=ideas`   |
+| `backend`  | `8000 → 8000`         | `DATABASE_URL=postgresql+psycopg://ideas:ideas@db:5432/ideas`           |
+| `frontend` | `80 → 80`             | `VITE_API_BASE_URL=http://localhost:8000`                               |
+
+Then open:
+
+- **Frontend:** <http://localhost> (nginx serving the built React app)
+- **Backend API:** <http://localhost:8000/api/ideas>
+- **Liveness:** <http://localhost:8000/healthz> · **Readiness:** <http://localhost:8000/readyz>
+
+Quick smoke test from the shell:
+
+```bash
+# List ideas (empty array on a fresh DB)
+curl -s http://localhost:8000/api/ideas
+
+# Create an idea (201 Created + the created row)
+curl -s -X POST http://localhost:8000/api/ideas \
+  -H 'Content-Type: application/json' \
+  -d '{"content": "Ship the thing"}'
+```
+
+Common Makefile shortcuts (see [Makefile](Makefile)):
+
+```bash
+make up      # docker compose up --build -d
+make logs    # tail all service logs
+make test    # run the backend test suite
+make down    # docker compose down -v (also drops the local DB volume)
+```
+
+To tear everything down and reclaim the volume: `make down` (or `docker compose down -v`).
+
+---
+
+## Cloud-Agnostic Approach
+
+The whole design splits into a **portable plane** that never knows which cloud it's on,
+and a **thin cloud-specific plane** that is the *only* place provider APIs appear.
+
+### Portable vs cloud-specific plane
+
+| Concern | Portable (identical everywhere) | Cloud-specific (the only deltas) |
+|---------|--------------------------------|----------------------------------|
+| Application | `app/backend`, `app/frontend` — 12-factor, zero cloud awareness | — |
+| Packaging | Docker images on GHCR | — |
+| Deploy unit | Helm chart `charts/idea-board` (all templates, `values.yaml`) | `values-aws.yaml` / `values-gcp.yaml` (storageClass + LB annotations only) |
+| Cluster add-ons | `infra/platform`: ingress-nginx, cert-manager, ESO, the chart | one ClusterSecretStore provider block (var-selected) |
+| Infra shape | Terraform **module contract** (same inputs/outputs) | `infra/modules/{aws,gcp}/*` implementations; `infra/stacks/{aws,gcp}` |
+| Secrets | Kubernetes Secret `idea-board-db` + ExternalSecret | which cloud secret store backs it |
+| Cluster auth | — | `scripts/get-kubeconfig.sh` (one `case` branch per cloud) |
+| AI tooling | `ai/healthcheck`, `ai/envgen`, `ai/explain` | — |
+| CI/CD | `.github/workflows/*` | a single `cloud` input |
+
+The rule of thumb: **if a file mentions a specific cloud, it belongs in the cloud-specific
+column — and there should be very few of them.**
+
+### The Terraform module contract
+
+Every cloud implements the *same three modules* with *identical inputs and outputs*. The
+stack (`infra/stacks/<cloud>`) wires them the same way regardless of provider; only the
+implementation inside `infra/modules/<cloud>/*` differs.
+
+**network** — `infra/modules/<cloud>/network`
+```hcl
+inputs  { name, region, cidr }
+outputs { network_id, subnet_ids (list), private_subnet_ids (list) }
+```
+
+**cluster** — `infra/modules/<cloud>/cluster`
+```hcl
+inputs {
+  name
+  region
+  k8s_version
+  node_size    # one of "small" | "medium" | "large"
+  node_count
+  network      # object from the network module's outputs
+}
+outputs {
+  cluster_name
+  kube_host
+  kube_ca_cert   # base64
+  oidc_provider
+}
+```
+
+**database** — `infra/modules/<cloud>/database`
+```hcl
+inputs {
+  name
+  engine_version
+  size          # "small" | "medium" | "large"
+  storage_gb
+  network
+  allowed_cidrs # list
+}
+outputs {
+  db_host
+  db_port
+  db_name
+  db_secret_ref # points at idea-board/db in the cloud secret store
+}
+```
+
+Because the signatures match, `infra/stacks/aws` and `infra/stacks/gcp` are nearly
+identical: each declares a `cloud` variable, calls `network → cluster → database`, and
+exposes `kube_host`, `kube_ca_cert`, `cluster_name`, and `db_host`.
+
+### T-shirt sizing
+
+Callers never name a machine type. They ask for `small`, `medium`, or `large`, and each
+cloud module translates internally. This keeps the *intent* portable and hides the
+provider's SKU vocabulary.
+
+| Size   | AWS cluster node | GCP cluster node   | AWS database   | GCP database   |
+|--------|------------------|--------------------|----------------|----------------|
+| small  | `t3.medium`      | `e2-medium`        | `db.t3.micro`  | `db-f1-micro`  |
+| medium | `m5.large`       | `e2-standard-4`    | `db.t3.small`  | `db-g1-small`  |
+| large  | `m5.2xlarge`     | `e2-standard-8`    | `db.t3.medium` | `db-custom-*`  |
+
+`ai/envgen` emits only these three tokens, so AI-proposed sizing is portable by
+construction.
+
+### External Secrets Operator (ESO)
+
+The database password is **never** written into Git, Terraform state files (as plaintext),
+or Helm values. Instead:
+
+1. The Terraform `database` module writes the password to the **cloud secret store**
+   (AWS Secrets Manager / GCP Secret Manager) at the logical key `idea-board/db`, and
+   returns a `db_secret_ref`.
+2. `infra/platform` installs **External Secrets Operator** and a ClusterSecretStore named
+   `cloud-secrets` (the only per-cloud difference is its auth/provider block).
+3. The chart's `externalsecret-db` template declares an **ExternalSecret** named
+   `idea-board-db` that references ClusterSecretStore `cloud-secrets` and remote key
+   `idea-board/db`.
+4. ESO materializes a Kubernetes **Secret** `idea-board-db` with key `DATABASE_URL`.
+5. The backend Deployment and the Alembic migration Job read `DATABASE_URL` from that
+   Secret.
+
+Same flow, same names, on every cloud — only *where the secret physically lives* changes.
+
+### Adding a 3rd cloud (Azure) — the shape of it
+
+Because of the module contract, adding Azure is **additive**, not a rewrite. In short:
+
+1. Implement `infra/modules/azure/{network,cluster,database}` honoring the exact
+   input/output signatures above (AKS + Azure Database for PostgreSQL + VNet; map the
+   t-shirt sizes to `Standard_*` VM sizes and Azure Postgres SKUs).
+2. Add `infra/stacks/azure` mirroring the AWS/GCP stacks (declare `cloud`, wire the
+   modules, expose the same four outputs). Use a partial backend for Azure Blob state.
+3. Add a `gcp`/`aws`-style `case` branch to `scripts/get-kubeconfig.sh`
+   (`az aks get-credentials …`).
+4. Add a `cloud-secrets` provider option in `infra/platform` pointing at **Azure Key
+   Vault**, and add `charts/idea-board/values-azure.yaml` (storageClass + LB annotations).
+5. Add `azure` to the `cloud` input enum in `.github/workflows/deploy.yml`.
+
+The application, chart templates, AI tooling, ESO wiring, and module *signatures* don't
+change at all. The full, copy-pasteable walkthrough is in
+[`docs/ADDING_A_CLOUD.md`](docs/ADDING_A_CLOUD.md).
+
+### Honest note: where the abstraction leaks
+
+Cloud-agnostic is a goal, not a lie. Real seams remain, and pretending otherwise would be
+worse than naming them:
+
+- **IAM / cluster-auth models genuinely differ.** EKS access entries, GKE Workload
+  Identity, and AKS AAD integration are not the same thing. `scripts/get-kubeconfig.sh`
+  papers over the *fetch*, but the *trust setup* (OIDC federation) is configured per cloud.
+- **T-shirt sizes are approximations.** `t3.medium`, `e2-medium`, and a `Standard_*` VM
+  are *similar*, not equal, in CPU/RAM/network/credit behavior. "Medium" performance will
+  differ across clouds.
+- **Managed Postgres has provider-specific knobs** (parameter groups, flags, maintenance
+  windows, backup semantics, TLS enforcement). The module contract exposes the common 80%;
+  the last 20% is deliberately not abstracted.
+- **LoadBalancer + storage annotations leak into `values-<cloud>.yaml`.** That's the point
+  of the overlay — but it *is* cloud-specific YAML you must maintain.
+- **Secret store auth differs.** ESO gives us one API, but IRSA (AWS), Workload Identity
+  (GCP), and Managed Identity (Azure) each need their own provider block.
+- **Networking defaults differ** (AZ/zone counts, NAT, service ranges), so the same `cidr`
+  input can produce subtly different topologies.
+- **Quotas, regional availability, and pricing** are entirely provider-specific and not
+  modeled here.
+
+We contain these leaks to a handful of well-marked files rather than eliminating them —
+which is the realistic definition of "cloud-agnostic."
+
+---
+
 ## CI/CD pipelines
 
 Delivery is split into **four workflows** so that *infrastructure* changes (rare, costly,
@@ -173,66 +388,6 @@ the deploy job **reads** stack outputs instead of applying them, so an app relea
 holds the infra state lock or needs infra-mutating IAM. Setup details (OIDC, repo
 variables/secrets, the Environment gate) are in
 [`docs/PIPELINE_SETUP.md`](docs/PIPELINE_SETUP.md).
-
----
-
-## Run locally with Docker Compose
-
-You do **not** need any cloud account, Kubernetes, or Terraform to run the whole app
-locally. Docker Compose brings up Postgres, the backend (which runs the Alembic
-migration on start), and the frontend.
-
-**Prerequisites:** Docker Engine + the Docker Compose v2 plugin.
-
-```bash
-# 1. Clone and enter the repo
-git clone https://github.com/OWNER/idea-board.git
-cd idea-board
-
-# 2. (optional) copy the example env; the compose file already has sane defaults
-cp .env.example .env
-
-# 3. Build and start db + backend + frontend
-docker compose up --build
-```
-
-That's it. Compose wires the three services together using these exact values (from the
-shared contract — do not change them for local runs):
-
-| Service    | Port (host→container) | Key environment                                                        |
-|------------|-----------------------|------------------------------------------------------------------------|
-| `db`       | `5432 → 5432`         | `POSTGRES_USER=ideas`, `POSTGRES_PASSWORD=ideas`, `POSTGRES_DB=ideas`   |
-| `backend`  | `8000 → 8000`         | `DATABASE_URL=postgresql+psycopg://ideas:ideas@db:5432/ideas`           |
-| `frontend` | `80 → 80`             | `VITE_API_BASE_URL=http://localhost:8000`                               |
-
-Then open:
-
-- **Frontend:** <http://localhost> (nginx serving the built React app)
-- **Backend API:** <http://localhost:8000/api/ideas>
-- **Liveness:** <http://localhost:8000/healthz> · **Readiness:** <http://localhost:8000/readyz>
-
-Quick smoke test from the shell:
-
-```bash
-# List ideas (empty array on a fresh DB)
-curl -s http://localhost:8000/api/ideas
-
-# Create an idea (201 Created + the created row)
-curl -s -X POST http://localhost:8000/api/ideas \
-  -H 'Content-Type: application/json' \
-  -d '{"content": "Ship the thing"}'
-```
-
-Common Makefile shortcuts (see [Makefile](Makefile)):
-
-```bash
-make up      # docker compose up --build -d
-make logs    # tail all service logs
-make test    # run the backend test suite
-make down    # docker compose down -v (also drops the local DB volume)
-```
-
-To tear everything down and reclaim the volume: `make down` (or `docker compose down -v`).
 
 ---
 
@@ -438,161 +593,6 @@ Naming these *is* part of the posture, not a footnote:
   blocking once the first run's findings are triaged.
 - **No image signing / provenance attestation** (cosign / SLSA) yet, and **no runtime
   NetworkPolicy / Pod Security enforcement** in the chart yet.
-
----
-
-## Cloud-Agnostic Approach
-
-The whole design splits into a **portable plane** that never knows which cloud it's on,
-and a **thin cloud-specific plane** that is the *only* place provider APIs appear.
-
-### Portable vs cloud-specific plane
-
-| Concern | Portable (identical everywhere) | Cloud-specific (the only deltas) |
-|---------|--------------------------------|----------------------------------|
-| Application | `app/backend`, `app/frontend` — 12-factor, zero cloud awareness | — |
-| Packaging | Docker images on GHCR | — |
-| Deploy unit | Helm chart `charts/idea-board` (all templates, `values.yaml`) | `values-aws.yaml` / `values-gcp.yaml` (storageClass + LB annotations only) |
-| Cluster add-ons | `infra/platform`: ingress-nginx, cert-manager, ESO, the chart | one ClusterSecretStore provider block (var-selected) |
-| Infra shape | Terraform **module contract** (same inputs/outputs) | `infra/modules/{aws,gcp}/*` implementations; `infra/stacks/{aws,gcp}` |
-| Secrets | Kubernetes Secret `idea-board-db` + ExternalSecret | which cloud secret store backs it |
-| Cluster auth | — | `scripts/get-kubeconfig.sh` (one `case` branch per cloud) |
-| AI tooling | `ai/healthcheck`, `ai/envgen`, `ai/explain` | — |
-| CI/CD | `.github/workflows/*` | a single `cloud` input |
-
-The rule of thumb: **if a file mentions a specific cloud, it belongs in the cloud-specific
-column — and there should be very few of them.**
-
-### The Terraform module contract
-
-Every cloud implements the *same three modules* with *identical inputs and outputs*. The
-stack (`infra/stacks/<cloud>`) wires them the same way regardless of provider; only the
-implementation inside `infra/modules/<cloud>/*` differs.
-
-**network** — `infra/modules/<cloud>/network`
-```hcl
-inputs  { name, region, cidr }
-outputs { network_id, subnet_ids (list), private_subnet_ids (list) }
-```
-
-**cluster** — `infra/modules/<cloud>/cluster`
-```hcl
-inputs {
-  name
-  region
-  k8s_version
-  node_size    # one of "small" | "medium" | "large"
-  node_count
-  network      # object from the network module's outputs
-}
-outputs {
-  cluster_name
-  kube_host
-  kube_ca_cert   # base64
-  oidc_provider
-}
-```
-
-**database** — `infra/modules/<cloud>/database`
-```hcl
-inputs {
-  name
-  engine_version
-  size          # "small" | "medium" | "large"
-  storage_gb
-  network
-  allowed_cidrs # list
-}
-outputs {
-  db_host
-  db_port
-  db_name
-  db_secret_ref # points at idea-board/db in the cloud secret store
-}
-```
-
-Because the signatures match, `infra/stacks/aws` and `infra/stacks/gcp` are nearly
-identical: each declares a `cloud` variable, calls `network → cluster → database`, and
-exposes `kube_host`, `kube_ca_cert`, `cluster_name`, and `db_host`.
-
-### T-shirt sizing
-
-Callers never name a machine type. They ask for `small`, `medium`, or `large`, and each
-cloud module translates internally. This keeps the *intent* portable and hides the
-provider's SKU vocabulary.
-
-| Size   | AWS cluster node | GCP cluster node   | AWS database   | GCP database   |
-|--------|------------------|--------------------|----------------|----------------|
-| small  | `t3.medium`      | `e2-medium`        | `db.t3.micro`  | `db-f1-micro`  |
-| medium | `m5.large`       | `e2-standard-4`    | `db.t3.small`  | `db-g1-small`  |
-| large  | `m5.2xlarge`     | `e2-standard-8`    | `db.t3.medium` | `db-custom-*`  |
-
-`ai/envgen` emits only these three tokens, so AI-proposed sizing is portable by
-construction.
-
-### External Secrets Operator (ESO)
-
-The database password is **never** written into Git, Terraform state files (as plaintext),
-or Helm values. Instead:
-
-1. The Terraform `database` module writes the password to the **cloud secret store**
-   (AWS Secrets Manager / GCP Secret Manager) at the logical key `idea-board/db`, and
-   returns a `db_secret_ref`.
-2. `infra/platform` installs **External Secrets Operator** and a ClusterSecretStore named
-   `cloud-secrets` (the only per-cloud difference is its auth/provider block).
-3. The chart's `externalsecret-db` template declares an **ExternalSecret** named
-   `idea-board-db` that references ClusterSecretStore `cloud-secrets` and remote key
-   `idea-board/db`.
-4. ESO materializes a Kubernetes **Secret** `idea-board-db` with key `DATABASE_URL`.
-5. The backend Deployment and the Alembic migration Job read `DATABASE_URL` from that
-   Secret.
-
-Same flow, same names, on every cloud — only *where the secret physically lives* changes.
-
-### Adding a 3rd cloud (Azure) — the shape of it
-
-Because of the module contract, adding Azure is **additive**, not a rewrite. In short:
-
-1. Implement `infra/modules/azure/{network,cluster,database}` honoring the exact
-   input/output signatures above (AKS + Azure Database for PostgreSQL + VNet; map the
-   t-shirt sizes to `Standard_*` VM sizes and Azure Postgres SKUs).
-2. Add `infra/stacks/azure` mirroring the AWS/GCP stacks (declare `cloud`, wire the
-   modules, expose the same four outputs). Use a partial backend for Azure Blob state.
-3. Add a `gcp`/`aws`-style `case` branch to `scripts/get-kubeconfig.sh`
-   (`az aks get-credentials …`).
-4. Add a `cloud-secrets` provider option in `infra/platform` pointing at **Azure Key
-   Vault**, and add `charts/idea-board/values-azure.yaml` (storageClass + LB annotations).
-5. Add `azure` to the `cloud` input enum in `.github/workflows/deploy.yml`.
-
-The application, chart templates, AI tooling, ESO wiring, and module *signatures* don't
-change at all. The full, copy-pasteable walkthrough is in
-[`docs/ADDING_A_CLOUD.md`](docs/ADDING_A_CLOUD.md).
-
-### Honest note: where the abstraction leaks
-
-Cloud-agnostic is a goal, not a lie. Real seams remain, and pretending otherwise would be
-worse than naming them:
-
-- **IAM / cluster-auth models genuinely differ.** EKS access entries, GKE Workload
-  Identity, and AKS AAD integration are not the same thing. `scripts/get-kubeconfig.sh`
-  papers over the *fetch*, but the *trust setup* (OIDC federation) is configured per cloud.
-- **T-shirt sizes are approximations.** `t3.medium`, `e2-medium`, and a `Standard_*` VM
-  are *similar*, not equal, in CPU/RAM/network/credit behavior. "Medium" performance will
-  differ across clouds.
-- **Managed Postgres has provider-specific knobs** (parameter groups, flags, maintenance
-  windows, backup semantics, TLS enforcement). The module contract exposes the common 80%;
-  the last 20% is deliberately not abstracted.
-- **LoadBalancer + storage annotations leak into `values-<cloud>.yaml`.** That's the point
-  of the overlay — but it *is* cloud-specific YAML you must maintain.
-- **Secret store auth differs.** ESO gives us one API, but IRSA (AWS), Workload Identity
-  (GCP), and Managed Identity (Azure) each need their own provider block.
-- **Networking defaults differ** (AZ/zone counts, NAT, service ranges), so the same `cidr`
-  input can produce subtly different topologies.
-- **Quotas, regional availability, and pricing** are entirely provider-specific and not
-  modeled here.
-
-We contain these leaks to a handful of well-marked files rather than eliminating them —
-which is the realistic definition of "cloud-agnostic."
 
 ---
 
