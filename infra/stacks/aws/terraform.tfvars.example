@@ -1,0 +1,25 @@
+# infra/stacks/aws/terraform.tfvars.example
+#
+# Copy to terraform.tfvars and edit, or pass with -var-file=.
+# Backend (bucket/key/lock table) is supplied separately at `terraform init`
+# time via -backend-config (see backend.tf) — do NOT put it here.
+
+cloud  = "aws"
+region = "us-east-1"
+name   = "idea-board"
+
+# --- Network ---
+vpc_cidr = "10.20.0.0/16"
+
+# --- Cluster (EKS) ---
+k8s_version = "1.33"
+node_size   = "small" # small=t3.medium | medium=m5.large | large=m5.2xlarge
+node_count  = 2
+
+# --- Database (RDS Postgres) ---
+db_engine_version = "16.3"
+db_size           = "small" # small=db.t3.micro | medium=db.t3.small | large=db.t3.medium
+db_storage_gb     = 20
+
+# Extra CIDRs allowed to reach Postgres (the VPC CIDR is always allowed).
+db_allowed_cidrs = []

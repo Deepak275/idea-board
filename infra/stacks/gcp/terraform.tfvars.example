@@ -1,0 +1,32 @@
+# infra/stacks/gcp/terraform.tfvars.example
+#
+# Copy to terraform.tfvars and edit, or pass with -var-file=.
+# Backend (bucket/prefix) is supplied separately at `terraform init` time via
+# -backend-config (see backend.tf) — do NOT put it here.
+
+cloud      = "gcp"
+project_id = "my-gcp-project-id" # REQUIRED — your GCP project
+region     = "us-central1"
+name       = "idea-board"
+
+# --- Network ---
+# Primary subnet range. Must NOT overlap the pod (10.96.0.0/14) or service
+# (10.92.0.0/18) secondary ranges created by modules/gcp/network.
+vpc_cidr = "10.30.0.0/16"
+
+# --- Cluster (GKE) ---
+k8s_version = "1.33"
+node_size   = "small" # small=e2-medium | medium=e2-standard-4 | large=e2-standard-8
+node_count  = 1
+
+# --- Database (Cloud SQL Postgres) ---
+db_engine_version = "16"
+db_size           = "small" # small=db-f1-micro | medium=db-g1-small | large=db-custom-2-7680
+db_storage_gb     = 20
+
+db_allowed_cidrs = []
+
+# NOTE (leaky abstraction, documented in README): GCP Secret Manager ids cannot
+# contain "/", so the DB secret lands at "idea-board-db" here, whereas the AWS
+# side uses "idea-board/db". The per-cloud ClusterSecretStore in infra/platform
+# accounts for this.

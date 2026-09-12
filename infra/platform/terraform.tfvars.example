@@ -1,0 +1,41 @@
+# infra/platform/terraform.tfvars.example
+#
+# Copy to terraform.tfvars (gitignored) and fill in. Most values are IDENTICAL
+# across clouds — only the block under your chosen cloud differs.
+#
+# In CI these are passed as -var / TF_VAR_* (the cluster connection values come
+# straight from `terraform -chdir=infra/stacks/<cloud> output`).
+
+# ---- cloud selector ------------------------------------------------------
+cloud = "aws" # or "gcp"
+
+# ---- cluster connection (from infra/stacks/<cloud> outputs) --------------
+kube_host    = "https://XXXXXXXX.gr7.us-east-1.eks.amazonaws.com"
+kube_ca_cert = "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t..." # base64 (cluster module output kube_ca_cert)
+kube_token   = "k8s-aws-v1.aGVsbG8..."                    # short-lived bearer token (keep out of VCS)
+
+# ---- Let's Encrypt / cert-manager ----------------------------------------
+letsencrypt_email = "platform@example.com"
+# Use the staging directory while testing to avoid production rate limits:
+# acme_server = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+# ---- idea-board app chart overrides (CI usually sets these) --------------
+ingress_host              = "ideas.example.com"
+backend_image_repository  = "ghcr.io/OWNER/idea-board-backend"
+backend_image_tag         = "v1.2.3"
+frontend_image_repository = "ghcr.io/OWNER/idea-board-frontend"
+frontend_image_tag        = "v1.2.3"
+
+# ===========================================================================
+# CLOUD-CONDITIONAL — fill in ONLY the block for the cloud you selected above.
+# ===========================================================================
+
+# ---- when cloud = "aws" (SecretsManager ClusterSecretStore) --------------
+aws_region       = "us-east-1"
+aws_eso_role_arn = "arn:aws:iam::123456789012:role/idea-board-eso"
+
+# ---- when cloud = "gcp" (SecretManager ClusterSecretStore) ---------------
+# gcp_project_id                = "my-gcp-project"
+# gcp_location                  = "us-central1"
+# gcp_cluster_name              = "idea-board"
+# gcp_eso_service_account_email = "idea-board-eso@my-gcp-project.iam.gserviceaccount.com"
