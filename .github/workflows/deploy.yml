@@ -98,11 +98,14 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Build & push both images ONCE (they are cloud-independent). Deterministic
-  # tag = sha-<short>. GHCR paths use the lowercased owner (registry requires it).
+  # Build -> SCAN -> push (in that order): images are built LOCALLY, Trivy-gated
+  # (fixable HIGH/CRITICAL vulns or leaked secrets BLOCK the push), and only then
+  # pushed to GHCR. Gated on `verify` so a lint/test/tf/helm failure never builds.
+  # Deterministic tag = sha-<short>; GHCR paths use the lowercased owner.
   # ---------------------------------------------------------------------------
   build:
-    name: Build & push images (GHCR)
+    name: Build, scan & push images (GHCR)
+    needs: verify # no image is built/scanned/pushed unless validation passed
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -138,7 +141,79 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push backend
+      # 1) BUILD LOCALLY (load into the runner's docker) — do NOT push yet, so a
+      #    vulnerable image never reaches the registry.
+      - name: Build backend image (local, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: app/backend
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.backend_image }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Build frontend image (local, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: app/frontend
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.frontend_image }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
+
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      # 2a) REPORT: full findings (vuln+secret+misconfig) -> Security tab. Never blocks.
+      - name: Trivy SARIF (report to the Security tab)
+        continue-on-error: true
+        env:
+          BE: ${{ steps.meta.outputs.backend_image }}:${{ steps.meta.outputs.tag }}
+          FE: ${{ steps.meta.outputs.frontend_image }}:${{ steps.meta.outputs.tag }}
+        run: |
+          trivy image --scanners vuln,secret,misconfig --severity HIGH,CRITICAL \
+            --ignore-unfixed --format sarif --output backend.sarif  "$BE" || true
+          trivy image --scanners vuln,secret,misconfig --severity HIGH,CRITICAL \
+            --ignore-unfixed --format sarif --output frontend.sarif "$FE" || true
+
+      - name: Upload backend image findings to the Security tab
+        if: ${{ always() && hashFiles('backend.sarif') != '' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: backend.sarif
+          category: trivy-image-backend
+
+      - name: Upload frontend image findings to the Security tab
+        if: ${{ always() && hashFiles('frontend.sarif') != '' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: frontend.sarif
+          category: trivy-image-frontend
+
+      # 2b) GATE: BLOCK the push on fixable HIGH/CRITICAL vulns OR any leaked secret.
+      #     (misconfig stays report-only above to avoid base-image false positives.)
+      #     If this fails, the images below are never pushed and the deploy is skipped
+      #     (the live app keeps running its current image). Triage via base-image bump
+      #     or a reviewed .trivyignore, then re-run.
+      - name: Trivy gate — blocks push on HIGH/CRITICAL vulns or secrets
+        env:
+          BE: ${{ steps.meta.outputs.backend_image }}:${{ steps.meta.outputs.tag }}
+          FE: ${{ steps.meta.outputs.frontend_image }}:${{ steps.meta.outputs.tag }}
+        run: |
+          set -e
+          for img in "$BE" "$FE"; do
+            echo "== gating scan $img =="
+            trivy image --scanners vuln,secret --severity HIGH,CRITICAL \
+              --ignore-unfixed --exit-code 1 --no-progress "$img"
+          done
+
+      # 3) PUSH — only reached if `verify` passed AND the gate above passed. The
+      #    layers are cache-hits from the local build, so this is a near-instant push.
+      - name: Push backend image
         uses: docker/build-push-action@v6
         with:
           context: app/backend
@@ -149,7 +224,7 @@ jobs:
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
 
-      - name: Build & push frontend
+      - name: Push frontend image
         uses: docker/build-push-action@v6
         with:
           context: app/frontend
@@ -160,48 +235,14 @@ jobs:
           cache-from: type=gha,scope=frontend
           cache-to: type=gha,mode=max,scope=frontend
 
-      - name: Install Trivy
-        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-
-      - name: Trivy image scan (vuln + secret + misconfig, report-mode)
-        continue-on-error: true # report-mode: drop this line to GATE the build on findings after triage
-        env:
-          BE: ${{ steps.meta.outputs.backend_image }}:${{ steps.meta.outputs.tag }}
-          FE: ${{ steps.meta.outputs.frontend_image }}:${{ steps.meta.outputs.tag }}
-        run: |
-          scan() { # $1=image  $2=sarif output
-            echo "== scanning $1 =="
-            trivy image --scanners vuln,secret,misconfig --severity HIGH,CRITICAL \
-              --ignore-unfixed --no-progress "$1" || true
-            trivy image --scanners vuln,secret,misconfig --severity HIGH,CRITICAL \
-              --ignore-unfixed --format sarif --output "$2" "$1" || true
-          }
-          scan "$BE" backend.sarif
-          scan "$FE" frontend.sarif
-
-      - name: Upload backend image findings to the Security tab
-        if: hashFiles('backend.sarif') != ''
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: backend.sarif
-          category: trivy-image-backend
-
-      - name: Upload frontend image findings to the Security tab
-        if: hashFiles('frontend.sarif') != ''
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: frontend.sarif
-          category: trivy-image-frontend
-
   # ---------------------------------------------------------------------------
   # Pre-deploy GATE: run the same quality checks as CI so a broken commit never
   # deploys. The deploy job `needs:` this.
   # ---------------------------------------------------------------------------
   verify:
-    name: Verify (lint + tests + tf + helm) — gate before deploy
-    if: github.event_name == 'workflow_dispatch' # only gates a real deploy; CI covers pushes
+    name: Verify (lint + tests + tf + helm) — gate before build
+    # Runs on every trigger now: `build` needs it, so a lint/test/tf/helm failure
+    # stops the image from being built or pushed (not just the deploy).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -275,10 +316,10 @@ jobs:
   deploy:
     name: Deploy (${{ matrix.cloud }})
     # STANDARD app-CD posture: deploy on app/charts push, on manual dispatch, and
-    # after a successful "Provision infrastructure" run. `verify` is dispatch-only
-    # (CI covers pushes), so we tolerate it being SKIPPED but never when it FAILED;
-    # build + matrix must have succeeded. `!cancelled()` disables the implicit
-    # success() over `needs`, so a skipped `verify` does not auto-skip this job.
+    # after a successful "Provision infrastructure" run. verify + build + matrix must
+    # all have succeeded (build already needs verify, so a verify failure skips build
+    # and thus this job). `!cancelled()` + explicit result checks keep the event gate
+    # readable and robust across push / dispatch / workflow_run.
     if: >-
       !cancelled()
       && needs.build.result == 'success'
