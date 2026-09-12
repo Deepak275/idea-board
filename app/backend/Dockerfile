@@ -33,9 +33,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 # Patch OS packages so the runtime image ships current Debian security fixes
-# (gzip / pcre2 / sqlite / perl CVEs). Runs as root before dropping privileges;
-# CI's Trivy gate blocks the push if fixable HIGH/CRITICAL CVEs remain.
-RUN apt-get update && apt-get -y upgrade && rm -rf /var/lib/apt/lists/*
+# (gzip / pcre2 / sqlite / perl CVEs). Also upgrade the BASE IMAGE's *system*
+# Python setuptools (separate from /opt/venv) — python:3.12-slim ships 70.3.0
+# which has CVE-2025-47273. Runs as root before dropping privileges; CI's Trivy
+# gate blocks the push if fixable HIGH/CRITICAL CVEs remain.
+RUN apt-get update && apt-get -y upgrade && rm -rf /var/lib/apt/lists/* \
+    && /usr/local/bin/python -m pip install --no-cache-dir --upgrade "setuptools>=78.1.1"
 
 # Copy the pre-built virtualenv from the builder stage.
 COPY --from=builder /opt/venv /opt/venv
