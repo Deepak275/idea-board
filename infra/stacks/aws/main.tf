@@ -40,6 +40,34 @@ module "cluster" {
   }
 }
 
+# --- Cluster access (EKS Access Entries) ----------------------------------
+# Grant the listed IAM principals (e.g. the CI/CD deploy role) cluster-admin, so
+# `helm`/`kubectl` work regardless of which identity created the cluster. This
+# is AWS-specific glue and therefore lives in the stack, not the shared module
+# interface (keeps the cloud-agnostic module contract intact). GCP grants the
+# equivalent via IAM in its own stack.
+resource "aws_eks_access_entry" "admin" {
+  for_each = toset(var.cluster_admin_principals)
+
+  cluster_name  = module.cluster.cluster_name
+  principal_arn = each.value
+  type          = "STANDARD"
+}
+
+resource "aws_eks_access_policy_association" "admin" {
+  for_each = toset(var.cluster_admin_principals)
+
+  cluster_name  = module.cluster.cluster_name
+  principal_arn = each.value
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+
+  access_scope {
+    type = "cluster"
+  }
+
+  depends_on = [aws_eks_access_entry.admin]
+}
+
 module "database" {
   source = "../../modules/aws/database"
 

@@ -65,6 +65,18 @@ resource "aws_eks_cluster" "this" {
     endpoint_public_access  = true
   }
 
+  # API_AND_CONFIG_MAP enables EKS Access Entries (see the stack) so IAM
+  # principals other than the cluster creator (e.g. the CI/CD deploy role) can
+  # be granted kubectl/helm access declaratively. CONFIG_MAP-only would force
+  # aws-auth ConfigMap surgery and lock out non-creator principals.
+  access_config {
+    authentication_mode = "API_AND_CONFIG_MAP"
+    # Create-only; set explicitly to match the existing cluster (omitting it reads
+    # as true->null and forces REPLACEMENT of a live cluster). true also grants
+    # the pipeline deploy-role admin when it creates a fresh cluster.
+    bootstrap_cluster_creator_admin_permissions = true
+  }
+
   tags = local.tags
 
   depends_on = [

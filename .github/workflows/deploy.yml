@@ -312,6 +312,9 @@ jobs:
           TF_VAR_cloud: ${{ matrix.cloud }}
           TF_VAR_region: ${{ matrix.cloud == 'aws' && vars.AWS_REGION || vars.GCP_REGION }}
           TF_VAR_project: ${{ vars.GCP_PROJECT }}
+          # Grant the deploy role EKS cluster-admin via an Access Entry (AWS stack
+          # only; TF ignores an undeclared TF_VAR for the GCP stack).
+          TF_VAR_cluster_admin_principals: ${{ matrix.cloud == 'aws' && format('["{0}"]', vars.AWS_DEPLOY_ROLE_ARN) || '[]' }}
         run: |
           set -e
           if [ "$CLOUD" = "aws" ]; then
@@ -371,7 +374,15 @@ jobs:
       - name: Terraform apply — platform add-ons
         run: |
           set -e
-          terraform -chdir=infra/platform init -input=false
+          # Persistent remote state (per cloud) so add-ons aren't recreated each run.
+          # NOTE: the backend is S3; a real GCP deploy needs its platform state in
+          # GCS (or a cloud-neutral backend) — tracked as a known limitation.
+          terraform -chdir=infra/platform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=idea-board/${CLOUD}/platform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
 
           # Cloud-conditional ESO wiring (the only per-cloud platform inputs).
           extra_vars=()

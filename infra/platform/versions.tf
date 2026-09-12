@@ -7,6 +7,12 @@
 terraform {
   required_version = ">= 1.5.0"
 
+  # Remote state so the installed add-ons are tracked across pipeline runs.
+  # Without this, CI state was ephemeral and every apply tried to recreate the
+  # already-installed releases ("cannot re-use a name that is still in use").
+  # Partial config: the pipeline passes bucket/key/region/dynamodb_table on init.
+  backend "s3" {}
+
   required_providers {
     # Installs the platform add-ons and the idea-board app chart.
     helm = {
