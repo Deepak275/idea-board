@@ -18,7 +18,8 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 COPY requirements.txt ./
-RUN pip install --upgrade pip && pip install -r requirements.txt
+# Upgrade pip + setuptools (setuptools <78.1.1 has CVE-2025-47273) before deps.
+RUN pip install --upgrade pip "setuptools>=78.1.1" && pip install -r requirements.txt
 
 # ---------------------------------------------------------------------------
 # Stage 2: minimal runtime image, non-root.
@@ -30,6 +31,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
+
+# Patch OS packages so the runtime image ships current Debian security fixes
+# (gzip / pcre2 / sqlite / perl CVEs). Runs as root before dropping privileges;
+# CI's Trivy gate blocks the push if fixable HIGH/CRITICAL CVEs remain.
+RUN apt-get update && apt-get -y upgrade && rm -rf /var/lib/apt/lists/*
 
 # Copy the pre-built virtualenv from the builder stage.
 COPY --from=builder /opt/venv /opt/venv

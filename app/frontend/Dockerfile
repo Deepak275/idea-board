@@ -19,9 +19,9 @@ RUN npm run build
 ###############################################################################
 FROM nginx:alpine AS runtime
 
-# libcap provides setcap, which lets the unprivileged nginx user bind the
-# privileged port 80 without running the process as root.
-RUN apk add --no-cache libcap
+# Patch Alpine packages (current security fixes), then install libcap — setcap
+# lets the unprivileged nginx user bind privileged port 80 without running as root.
+RUN apk upgrade --no-cache && apk add --no-cache libcap
 
 # SPA-aware server config (routing + caching + security headers).
 COPY nginx.conf /etc/nginx/conf.d/default.conf
