@@ -4,3 +4,5 @@ SQLAlchemy>=2.0,<2.1
 psycopg[binary]>=3.1,<4.0
 alembic>=1.13,<2.0
 pydantic>=2.7,<3.0
+# Pin the transitive msgpack up off the CVE (GHSA-6v7p-g79w-8964, fixed in 1.2.1).
+msgpack>=1.2.1
