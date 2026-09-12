@@ -1,39 +1,63 @@
 # =============================================================================
-# Build & Deploy.
+# Build & Deploy — the APP half of the split pipeline.
 #
-# PUSH to main       -> BUILD ONLY: build + push images to GHCR + image security
-#                       scan (vuln/secret/misconfig). Nothing is deployed.
-# MANUAL dispatch    -> FULL pipeline: verify gate -> build -> deploy to the
-#                       chosen cloud (aws|gcp, or both via matrix).
+# This workflow owns the APPLICATION lifecycle only: build + push images and
+# deploy the idea-board Helm chart onto an ALREADY-provisioned cluster. Anything
+# that MUTATES the cloud account — the Terraform cloud stack (VPC + cluster +
+# Postgres) and the portable platform add-ons (ingress-nginx, cert-manager,
+# external-secrets + the "cloud-secrets" ClusterSecretStore) — lives in
+# "Provision infrastructure" (.github/workflows/provision.yml). This workflow
+# NEVER runs `terraform apply`; it only READS the stack's remote state.
 #
-# Deploy flow (per cloud), all on manual dispatch only:
-#   verify ─► build ─► [matrix per cloud]
-#     1. terraform apply infra/stacks/<cloud>   (VPC + cluster + Postgres)
-#     2. scripts/get-kubeconfig.sh <cloud>       (the ONLY cloud auth shim)
-#     3. terraform apply infra/platform          (add-ons: ingress-nginx,
-#        cert-manager, external-secrets + ClusterSecretStore "cloud-secrets")
-#     4. helm upgrade --install idea-board       (-f values.yaml -f values-<cloud>.yaml,
+# Triggers:
+#   PUSH to main (app/**, charts/**, this file)   -> full app pipeline.
+#   MANUAL dispatch                               -> full app pipeline (pick cloud).
+#   workflow_run after "Provision infrastructure" -> redeploy once infra is ready.
+#
+# Deploy flow (per cloud):
+#   [verify] ─► build ─► [matrix per cloud] ─► deploy
+#     1. terraform init + `terraform output -raw`  (READ-ONLY: read cluster_name /
+#        region from the stack's remote state — NO apply, NO state lock)
+#     2. scripts/get-kubeconfig.sh <cloud>         (the ONLY cloud auth shim)
+#     3. helm upgrade --install idea-board         (-f values.yaml -f values-<cloud>.yaml,
 #        with the freshly built image tags; migration runs as a pre-upgrade Job)
-#     5. checks: DETERMINISTIC gate = helm rollout OK + public URL returns 200.
+#     4. checks: DETERMINISTIC gate = helm rollout OK + public URL returns 200.
 #        AI health-check (Claude proposes -> schema-validated) runs ADVISORY only.
-#     6. on failed gate: `helm rollback` + post a summary.
+#     5. on failed gate: `helm rollback` + post a summary.
 #
 # Security posture:
 #   * Cloud auth is OIDC only — NO long-lived cloud keys are stored.
 #   * The LLM never receives cloud credentials or Kubernetes Secrets; it only
 #     sees redacted kubectl text (see ai/healthcheck), and it never gates.
 #   * ANTHROPIC_API_KEY is optional; without it the AI check is skipped.
+#
+# ---------------------------------------------------------------------------
+# LEAST-PRIVILEGE TODO (shared convention with provision.yml):
+#   For now BOTH "Build & Deploy" and "Provision infrastructure" assume the
+#   single OIDC role vars.AWS_DEPLOY_ROLE_ARN. Recommended follow-up is to split
+#   into two least-privilege roles:
+#     * provision  = MUTATE infra (terraform apply on the stack + platform)
+#     * app deploy = READ remote state + CONNECT to the cluster (helm/kubectl)
+#   IF you split them, provision's stack TF_VAR_cluster_admin_principals MUST
+#   still include THIS app-deploy role ARN (in addition to the provision role),
+#   or helm/kubectl below will be RBAC-denied on the EKS Access Entry.
+# ---------------------------------------------------------------------------
 # =============================================================================
 name: Build & Deploy
 
-# Push to main  -> BUILD only: build + push images to GHCR + image security scan
-#                  (continuous delivery of artifacts; nothing is deployed).
-# Manual dispatch -> FULL pipeline: verify gate -> build -> deploy to the chosen
-#                  cloud (deliberate, because it applies infra + exposes a public
-#                  URL on a billing cluster).
+# App-CD posture: auto-deploy on APP changes merged to main; deliberate manual
+# dispatch; and an optional redeploy right after infra is (re)provisioned. This
+# is safe because `helm upgrade --install` is idempotent and the link-check +
+# rollback gate protects every path.
 on:
+  # Auto-deploy only when the APP or its chart changes (infra pushes are handled
+  # by "Provision infrastructure"; this file itself so pipeline edits self-test).
   push:
     branches: [main]
+    paths:
+      - "app/**"
+      - "charts/**"
+      - ".github/workflows/deploy.yml"
   workflow_dispatch:
     inputs:
       cloud:
@@ -49,6 +73,13 @@ on:
         description: "Deploy to BOTH clouds (matrix fan-out; ignores the 'cloud' input)"
         type: boolean
         default: false
+  # Optional: redeploy the app once "Provision infrastructure" finishes (e.g. a
+  # freshly (re)built cluster). The deploy job gates on conclusion == 'success';
+  # workflow_run does NOT auto-checkout the triggering commit, so that job checks
+  # out github.event.workflow_run.head_sha explicitly.
+  workflow_run:
+    workflows: ["Provision infrastructure"]
+    types: [completed]
 
 # Least privilege by default; jobs widen as needed.
 permissions:
@@ -216,7 +247,12 @@ jobs:
   # ---------------------------------------------------------------------------
   matrix:
     name: Resolve deploy matrix
-    if: github.event_name == 'workflow_dispatch'
+    # Must run on EVERY path that can reach `deploy` (push / dispatch /
+    # workflow_run-after-success) so the matrix output is always available to it.
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     outputs:
       clouds: ${{ steps.mk.outputs.clouds }}
@@ -226,7 +262,10 @@ jobs:
           if [ "${{ github.event.inputs.deploy_both }}" = "true" ]; then
             echo 'clouds=["aws","gcp"]' >> "$GITHUB_OUTPUT"
           else
-            echo "clouds=[\"${{ github.event.inputs.cloud }}\"]" >> "$GITHUB_OUTPUT"
+            # push / workflow_run carry no inputs.cloud -> default to aws
+            # (mirrors provision.yml's `resolve` job).
+            cloud="${{ github.event.inputs.cloud }}"
+            echo "clouds=[\"${cloud:-aws}\"]" >> "$GITHUB_OUTPUT"
           fi
 
   # ---------------------------------------------------------------------------
@@ -235,7 +274,21 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy (${{ matrix.cloud }})
-    if: github.event_name == 'workflow_dispatch' # never auto-deploys on push
+    # STANDARD app-CD posture: deploy on app/charts push, on manual dispatch, and
+    # after a successful "Provision infrastructure" run. `verify` is dispatch-only
+    # (CI covers pushes), so we tolerate it being SKIPPED but never when it FAILED;
+    # build + matrix must have succeeded. `!cancelled()` disables the implicit
+    # success() over `needs`, so a skipped `verify` does not auto-skip this job.
+    if: >-
+      !cancelled()
+      && needs.build.result == 'success'
+      && needs.matrix.result == 'success'
+      && needs.verify.result != 'failure'
+      && (
+           github.event_name == 'push'
+           || github.event_name == 'workflow_dispatch'
+           || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+         )
     needs: [verify, build, matrix]
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment }}
@@ -258,7 +311,13 @@ jobs:
       # Where the app is reachable once deployed (also used in the run summary).
       INGRESS_HOST: ${{ vars.INGRESS_HOST }}
     steps:
+      # workflow_run does NOT auto-checkout the triggering commit, so for that
+      # event we pin to the SHA provisioning ran against. For push / dispatch the
+      # expression is empty, which makes actions/checkout fall back to its default
+      # (the ref that triggered the run).
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -303,18 +362,15 @@ jobs:
         with:
           install_components: gke-gcloud-auth-plugin
 
-      # ---- 1) Cloud stack: network + cluster + database ---------------------
-      # Region/project are passed as TF_VAR_* env: Terraform silently ignores an
-      # env var for a variable a stack doesn't declare, so the same block works
-      # for both the AWS stack (region) and the GCP stack (region + project).
-      - name: Terraform apply — cloud stack
-        env:
-          TF_VAR_cloud: ${{ matrix.cloud }}
-          TF_VAR_region: ${{ matrix.cloud == 'aws' && vars.AWS_REGION || vars.GCP_REGION }}
-          TF_VAR_project: ${{ vars.GCP_PROJECT }}
-          # Grant the deploy role EKS cluster-admin via an Access Entry (AWS stack
-          # only; TF ignores an undeclared TF_VAR for the GCP stack).
-          TF_VAR_cluster_admin_principals: ${{ matrix.cloud == 'aws' && format('["{0}"]', vars.AWS_DEPLOY_ROLE_ARN) || '[]' }}
+      # ---- 1) Read cluster connection details from the stack's remote state --
+      # READ-ONLY: this workflow does NOT provision. "Provision infrastructure"
+      # owns `terraform apply`; here we only `init` the SAME remote backend (same
+      # backend-config as provision.yml) and read outputs. `terraform output`
+      # takes NO state lock and there is NO apply, so a deploy can never mutate
+      # the cloud stack. CLUSTER_NAME + REGION feed get-kubeconfig.sh below and
+      # the run summary. No TF_VARs are needed to read outputs.
+      - name: Terraform outputs — cluster connection (read-only, no apply)
+        id: tf
         run: |
           set -e
           if [ "$CLOUD" = "aws" ]; then
@@ -329,7 +385,14 @@ jobs:
               -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
               -backend-config="prefix=idea-board/gcp"
           fi
-          terraform -chdir="infra/stacks/$CLOUD" apply -auto-approve -input=false
+          # The two contract outputs later steps + get-kubeconfig.sh consume.
+          CLUSTER_NAME=$(terraform -chdir="infra/stacks/$CLOUD" output -raw cluster_name)
+          REGION=$(terraform -chdir="infra/stacks/$CLOUD" output -raw region)
+          {
+            echo "CLUSTER_NAME=$CLUSTER_NAME"
+            echo "REGION=$REGION"
+          } >> "$GITHUB_ENV"
+          echo "Resolved cluster=$CLUSTER_NAME region=$REGION (read-only)"
 
       # ---- 2) Point kubeconfig at the new cluster (THE cloud auth shim) ------
       - name: Get kubeconfig
@@ -339,88 +402,17 @@ jobs:
           chmod +x scripts/get-kubeconfig.sh
           ./scripts/get-kubeconfig.sh "$CLOUD"
 
-      # ---- Mint a short-lived bearer token for the platform TF providers -----
-      # The portable platform layer authenticates purely from kube_host/
-      # kube_ca_cert/kube_token vars (no cloud SDK). We read host/CA from the
-      # stack outputs and mint the token with the cloud CLI here.
-      - name: Resolve cluster connection details
-        id: kube
-        run: |
-          set -e
-          CLUSTER=$(terraform -chdir="infra/stacks/$CLOUD" output -raw cluster_name)
-          REGION=$(terraform -chdir="infra/stacks/$CLOUD" output -raw region)
-          KUBE_HOST=$(terraform -chdir="infra/stacks/$CLOUD" output -raw kube_host)
-          KUBE_CA=$(terraform -chdir="infra/stacks/$CLOUD" output -raw kube_ca_cert)
-          if [ "$CLOUD" = "aws" ]; then
-            KUBE_TOKEN=$(aws eks get-token --cluster-name "$CLUSTER" --region "$REGION" | jq -r '.status.token')
-          else
-            KUBE_TOKEN=$(gcloud auth print-access-token)
-          fi
-          {
-            echo "CLUSTER=$CLUSTER"
-            echo "REGION=$REGION"
-            echo "KUBE_HOST=$KUBE_HOST"
-            echo "KUBE_CA=$KUBE_CA"
-          } >> "$GITHUB_ENV"
-          # Token is sensitive: mask it and pass via env, never echo it.
-          echo "::add-mask::$KUBE_TOKEN"
-          echo "KUBE_TOKEN=$KUBE_TOKEN" >> "$GITHUB_ENV"
+      # NOTE: the kube bearer-token mint and the "Terraform apply — platform
+      # add-ons" step were REMOVED from this app pipeline — both now live in
+      # "Provision infrastructure" (provision.yml). The platform TF providers
+      # were the ONLY consumers of kube_host / kube_ca_cert / kube_token, so
+      # minting a bearer token here is no longer needed: helm + kubectl below
+      # authenticate via the kubeconfig get-kubeconfig.sh just wrote. (The stale
+      # "infra/platform has no remote backend" idempotency note went with them —
+      # the platform layer now uses the S3 backend, keyed
+      # idea-board/<cloud>/platform.tfstate; see provision.yml.)
 
-      # ---- 3) Portable platform layer: cluster ADD-ONS only -----------------
-      # We -target the add-ons and deliberately do NOT let Terraform install the
-      # app chart here: the app is owned by the explicit `helm upgrade` below so
-      # the AI gate can `helm rollback` a bad release cleanly. The app-chart
-      # resource in infra/platform is for the standalone/manual path.
-      - name: Terraform apply — platform add-ons
-        run: |
-          set -e
-          # Persistent remote state (per cloud) so add-ons aren't recreated each run.
-          # NOTE: the backend is S3; a real GCP deploy needs its platform state in
-          # GCS (or a cloud-neutral backend) — tracked as a known limitation.
-          terraform -chdir=infra/platform init -input=false -reconfigure \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=idea-board/${CLOUD}/platform.tfstate" \
-            -backend-config="region=${{ vars.AWS_REGION }}" \
-            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
-            -backend-config="encrypt=true"
-
-          # Cloud-conditional ESO wiring (the only per-cloud platform inputs).
-          extra_vars=()
-          if [ "$CLOUD" = "aws" ]; then
-            extra_vars+=( -var="aws_region=${REGION}" -var="aws_eso_role_arn=${{ vars.AWS_ESO_ROLE_ARN }}" )
-          else
-            extra_vars+=(
-              -var="gcp_project_id=${{ vars.GCP_PROJECT }}"
-              -var="gcp_location=${REGION}"
-              -var="gcp_cluster_name=${CLUSTER}"
-              -var="gcp_eso_service_account_email=${{ vars.GCP_ESO_SA_EMAIL }}"
-            )
-          fi
-
-          # Idempotency note: infra/platform has no remote backend defined (the
-          # contract only mandates remote state for the stacks), so CI state is
-          # ephemeral. A re-apply onto already-installed add-ons can report
-          # "release already exists"; we tolerate that and continue, because the
-          # downstream AI health-check is the real gate — if the ClusterSecretStore
-          # is genuinely missing, the app's ExternalSecret won't sync and the gate
-          # will roll the release back. In production, point this layer at a
-          # remote backend (see infra/platform/README.md).
-          terraform -chdir=infra/platform apply -auto-approve -input=false \
-            -target=terraform_data.input_guard \
-            -target=helm_release.ingress_nginx \
-            -target=helm_release.cert_manager \
-            -target=kubectl_manifest.letsencrypt_cluster_issuer \
-            -target=helm_release.external_secrets \
-            -target=kubectl_manifest.cloud_secrets_store \
-            -var="cloud=${CLOUD}" \
-            -var="kube_host=${KUBE_HOST}" \
-            -var="kube_ca_cert=${KUBE_CA}" \
-            -var="kube_token=${KUBE_TOKEN}" \
-            -var="letsencrypt_email=${{ vars.LETSENCRYPT_EMAIL }}" \
-            "${extra_vars[@]}" \
-          || echo "::warning::platform add-ons apply returned non-zero (add-ons may already exist); continuing — the AI health-check gates the result."
-
-      # ---- 4) Install/upgrade the app with the freshly built images ---------
+      # ---- 3) Install/upgrade the app with the freshly built images ---------
       - name: Helm upgrade --install idea-board
         id: helm
         continue-on-error: true # a failed rollout must reach the AI gate + rollback below
@@ -447,7 +439,7 @@ jobs:
           helm upgrade --install "$RELEASE" charts/idea-board \
             "${args[@]}" --wait --timeout 10m
 
-      # ---- 5a) AI health-check (ADVISORY) -----------------------------------
+      # ---- 4a) AI health-check (ADVISORY) -----------------------------------
       # Claude proposes a structured verdict; ai/healthcheck validates it against
       # a JSON Schema. ADVISORY for now: it does NOT gate the release — the
       # deterministic checks below (helm rollout + public-URL 200) decide. If no
@@ -470,7 +462,7 @@ jobs:
           echo "hc_code=$code" >> "$GITHUB_OUTPUT"
           echo "health-check exit code: $code"
 
-      # ---- 5b) Post-deploy link/smoke check: does the PUBLIC URL return 200? -
+      # ---- 4b) Post-deploy link/smoke check: does the PUBLIC URL return 200? -
       - name: Post-deploy link check
         id: linkcheck
         continue-on-error: true
@@ -510,7 +502,7 @@ jobs:
           echo "app_host=${ING_HOST:-$LB}" >> "$GITHUB_OUTPUT"
           echo "lb_addr=$LB" >> "$GITHUB_OUTPUT"
 
-      # ---- 6) Decide: keep, or roll back + summarise ------------------------
+      # ---- 5) Decide: keep, or roll back + summarise ------------------------
       - name: Gate — keep or roll back the release
         if: always()
         run: |
