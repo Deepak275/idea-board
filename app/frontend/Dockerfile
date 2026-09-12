@@ -3,7 +3,7 @@
 ###############################################################################
 # Build stage: compile the Vite + React + TypeScript app to static assets.
 ###############################################################################
-FROM node:20-alpine AS build
+FROM node:26-alpine AS build
 WORKDIR /app
 
 # Install dependencies first for better layer caching.
