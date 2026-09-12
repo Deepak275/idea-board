@@ -60,6 +60,10 @@ on:
         description: "Deployment environment (maps to a GitHub Environment for protection rules)"
         type: string
         default: production
+      intent:
+        description: "Optional AI sizing intent (envgen), e.g. 'cost-sensitive staging'. Blank = stack defaults."
+        type: string
+        default: ""
 
 # Least privilege by default; the only elevation needed is OIDC token minting.
 permissions:
@@ -140,6 +144,48 @@ jobs:
         with:
           install_components: gke-gcloud-auth-plugin
 
+      # ---- AI sizing (envgen): intent -> validated node_size/node_count -----
+      # ADVISORY dynamic environment configuration. If an `intent` was given AND a
+      # key is present, envgen (propose -> JSON-Schema validate -> clamp) turns the
+      # plain-English intent into node_size/node_count, exported as TF_VAR_* so the
+      # plan below reflects it. No key / no intent -> silently uses stack defaults.
+      # The model only proposes a bounded config; the human still approves the apply.
+      - name: Set up Python (for envgen)
+        if: ${{ github.event.inputs.intent != '' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: AI sizing from intent (envgen, advisory)
+        if: ${{ github.event.inputs.intent != '' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          INTENT: ${{ github.event.inputs.intent }}
+        run: |
+          set -e
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::warning::intent='${INTENT}' given but ANTHROPIC_API_KEY is unset — using the stack's default sizing."
+            exit 0
+          fi
+          pip install -q -r ai/envgen/requirements.txt
+          out="$(python ai/envgen/main.py "$INTENT" || true)"
+          printf '%s\n' "$out"
+          line="$(printf '%s\n' "$out" | grep -m1 '# node_size=' || true)"
+          if [ -z "$line" ]; then
+            echo "::warning::envgen produced no valid proposal (see log) — using default sizing."
+            exit 0
+          fi
+          ns="$(printf '%s' "$line" | sed -E 's/.*node_size=([a-z]+).*/\1/')"
+          nc="$(printf '%s' "$line" | sed -E 's/.*node_count=([0-9]+).*/\1/')"
+          echo "TF_VAR_node_size=$ns"  >> "$GITHUB_ENV"
+          echo "TF_VAR_node_count=$nc" >> "$GITHUB_ENV"
+          {
+            echo "### 🧠 AI sizing (envgen) — intent: \`${INTENT}\` → node_size=\`$ns\` node_count=\`$nc\`"
+            echo '```'
+            printf '%s\n' "$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # ---- Cloud stack plan: network + cluster + database -------------------
       # Same backend-config as deploy.yml's stack init. Region/project are passed
       # as TF_VAR_* env (Terraform silently ignores an env var for a variable a
@@ -214,6 +260,46 @@ jobs:
         uses: google-github-actions/setup-gcloud@v2
         with:
           install_components: gke-gcloud-auth-plugin
+
+      # ---- AI sizing (envgen): intent -> validated node_size/node_count -----
+      # Same advisory dynamic-config step as the plan job, so an approved apply
+      # sizes the cluster from the intent the human typed. Exports TF_VAR_* picked
+      # up by the apply below; no key / no intent -> stack defaults.
+      - name: Set up Python (for envgen)
+        if: ${{ github.event.inputs.intent != '' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: AI sizing from intent (envgen, advisory)
+        if: ${{ github.event.inputs.intent != '' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          INTENT: ${{ github.event.inputs.intent }}
+        run: |
+          set -e
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::warning::intent='${INTENT}' given but ANTHROPIC_API_KEY is unset — using the stack's default sizing."
+            exit 0
+          fi
+          pip install -q -r ai/envgen/requirements.txt
+          out="$(python ai/envgen/main.py "$INTENT" || true)"
+          printf '%s\n' "$out"
+          line="$(printf '%s\n' "$out" | grep -m1 '# node_size=' || true)"
+          if [ -z "$line" ]; then
+            echo "::warning::envgen produced no valid proposal (see log) — using default sizing."
+            exit 0
+          fi
+          ns="$(printf '%s' "$line" | sed -E 's/.*node_size=([a-z]+).*/\1/')"
+          nc="$(printf '%s' "$line" | sed -E 's/.*node_count=([0-9]+).*/\1/')"
+          echo "TF_VAR_node_size=$ns"  >> "$GITHUB_ENV"
+          echo "TF_VAR_node_count=$nc" >> "$GITHUB_ENV"
+          {
+            echo "### 🧠 AI sizing (envgen) — intent: \`${INTENT}\` → node_size=\`$ns\` node_count=\`$nc\`"
+            echo '```'
+            printf '%s\n' "$out"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # ---- 1) Cloud stack: network + cluster + database ---------------------
       # Region/project are passed as TF_VAR_* env: Terraform silently ignores an
