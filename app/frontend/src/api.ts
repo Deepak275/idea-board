@@ -6,6 +6,10 @@
 //      lets one built image target different backends per deployment.
 //   2. Build-time env: import.meta.env.VITE_API_BASE_URL (useful for local dev).
 //   3. Default: http://localhost:8000 (matches the docker-compose contract).
+//
+// An explicitly provided EMPTY string means "same origin" — the SPA calls a
+// relative /api/ideas. That is the behind-an-ingress case (frontend + API share
+// the load balancer origin), so no absolute URL / CORS is needed.
 
 export interface Idea {
   id: number;
@@ -26,7 +30,10 @@ export function getApiBaseUrl(): string {
     typeof window !== "undefined" ? window.__ENV__?.VITE_API_BASE_URL : undefined;
   const buildTime = import.meta.env.VITE_API_BASE_URL;
 
-  const resolved = (runtime && runtime.trim()) || (buildTime && buildTime.trim()) || "http://localhost:8000";
+  // A value that is DEFINED (even "") wins — "" = same origin (relative). Only
+  // fall back to the localhost dev default when nothing was provided at all.
+  const resolved =
+    runtime !== undefined ? runtime : buildTime !== undefined ? buildTime : "http://localhost:8000";
 
   // Normalize away a trailing slash so path concatenation is predictable.
   return resolved.replace(/\/+$/, "");

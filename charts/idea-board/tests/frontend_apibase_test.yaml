@@ -1,0 +1,27 @@
+suite: frontend API base URL
+# Behind an ingress the SPA and API share one origin, so VITE_API_BASE_URL must
+# be EMPTY (relative /api/ideas). A non-empty localhost/derived value made the
+# browser fetch the wrong host ("Failed to fetch").
+templates:
+  - templates/deployment-frontend.yaml
+tests:
+  - it: uses same-origin (empty) API base when behind an ingress
+    set:
+      ingress.enabled: true
+      ingress.host: ""
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: VITE_API_BASE_URL
+            value: ""
+
+  - it: honours an explicit apiBaseUrl override
+    set:
+      frontend.apiBaseUrl: "https://api.example.com"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: VITE_API_BASE_URL
+            value: "https://api.example.com"
