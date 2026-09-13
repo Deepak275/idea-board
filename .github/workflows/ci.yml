@@ -264,3 +264,31 @@ jobs:
       - name: Note when plan/explain is skipped
         if: ${{ vars.AWS_PLAN_ROLE_ARN == '' }}
         run: echo "::notice::AWS_PLAN_ROLE_ARN not set; skipping AI plan explanation (configure OIDC + repo variables to enable)."
+
+  # ---------------------------------------------------------------------------
+  # Security scan (Trivy): dependencies, leaked secrets, and IaC / Dockerfile /
+  # K8s misconfigurations. REPORT MODE for now (continue-on-error) — findings
+  # surface in the job log without blocking, because the thresholds could not be
+  # pre-validated locally. Remove `continue-on-error` to make it a hard gate
+  # once the first run's findings are triaged (see docs/PIPELINE_SETUP.md).
+  # ---------------------------------------------------------------------------
+  security:
+    name: Security scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Leaked-secret scan
+        continue-on-error: true
+        run: trivy fs . --scanners secret --exit-code 1 --no-progress
+
+      - name: Dependency vulnerabilities (HIGH/CRITICAL, fixable)
+        continue-on-error: true
+        run: trivy fs . --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress
+
+      - name: IaC / Dockerfile / K8s misconfig
+        continue-on-error: true
+        run: trivy fs . --scanners misconfig --severity HIGH,CRITICAL --exit-code 1 --no-progress
