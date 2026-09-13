@@ -52,10 +52,12 @@ variable "node_size" {
 variable "node_count" {
   description = "Desired number of worker nodes (single zone, since the cluster is zonal)."
   type        = number
-  # 2 e2-medium nodes: 1 couldn't fit the add-on stack (cert-manager + ESO +
-  # ingress-nginx) — the ingress controller stayed Pending "Insufficient cpu".
-  # Matches the AWS default; comfortably runs the add-ons + the app.
-  default = 2
+  # 3 e2-medium nodes. GKE reserves heavily on shared-core E2 (~945m allocatable
+  # CPU per e2-medium, not ~2000m), so 2 nodes sat at ~92% from add-ons + system
+  # alone and the app's replicas (2 backend + 2 frontend) couldn't schedule. 3
+  # gives the headroom to run the add-ons AND the app at 2 replicas each — keeping
+  # the Helm chart identical to AWS rather than trimming GCP replicas.
+  default = 3
 }
 
 variable "db_engine_version" {
