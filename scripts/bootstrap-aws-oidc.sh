@@ -18,6 +18,8 @@ set -euo pipefail
 
 REPO="${1:?usage: bootstrap-aws-oidc.sh <github_owner/repo> [region]}"
 REGION="${2:-us-east-1}"
+OWNER="${REPO%%/*}"     # for the immutable-ID subject form repo:<owner>@<id>/<repo>@<id>:*
+REPONAME="${REPO##*/}"
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
 OIDC_HOST="token.actions.githubusercontent.com"
 OIDC_ARN="arn:aws:iam::${ACCOUNT}:oidc-provider/${OIDC_HOST}"
@@ -47,7 +49,7 @@ DEPLOY_TRUST=$(cat <<JSON
   "Action":"sts:AssumeRoleWithWebIdentity",
   "Condition":{
     "StringEquals":{"${OIDC_HOST}:aud":"sts.amazonaws.com"},
-    "StringLike":{"${OIDC_HOST}:sub":"repo:${REPO}:*"}
+    "StringLike":{"${OIDC_HOST}:sub":["repo:${REPO}:*","repo:${OWNER}@*/${REPONAME}@*:*"]}
   }}]}
 JSON
 )
