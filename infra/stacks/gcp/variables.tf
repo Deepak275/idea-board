@@ -50,9 +50,12 @@ variable "node_size" {
 }
 
 variable "node_count" {
-  description = "Desired number of worker nodes (per zone for regional cluster)."
+  description = "Desired number of worker nodes (single zone, since the cluster is zonal)."
   type        = number
-  default     = 1
+  # 2 e2-medium nodes: 1 couldn't fit the add-on stack (cert-manager + ESO +
+  # ingress-nginx) — the ingress controller stayed Pending "Insufficient cpu".
+  # Matches the AWS default; comfortably runs the add-ons + the app.
+  default     = 2
 }
 
 variable "db_engine_version" {
