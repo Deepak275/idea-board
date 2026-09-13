@@ -55,7 +55,7 @@ variable "node_count" {
   # 2 e2-medium nodes: 1 couldn't fit the add-on stack (cert-manager + ESO +
   # ingress-nginx) — the ingress controller stayed Pending "Insufficient cpu".
   # Matches the AWS default; comfortably runs the add-ons + the app.
-  default     = 2
+  default = 2
 }
 
 variable "db_engine_version" {
