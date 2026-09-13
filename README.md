@@ -115,6 +115,8 @@ migration on start), and the frontend.
 
 **Prerequisites:** Docker Engine + the Docker Compose v2 plugin.
 
+Make sure the Docker daemon is **running and connected** before you start — `docker info` should succeed (if it errors, start Docker Desktop, or `sudo systemctl start docker` on Linux).
+
 ```bash
 # 1. Clone and enter the repo
 git clone https://github.com/OWNER/idea-board.git
