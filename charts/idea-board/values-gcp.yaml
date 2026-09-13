@@ -6,12 +6,19 @@
 #         -f values.yaml -f values-gcp.yaml
 #
 # CONTRACT: this overlay differs from values.yaml (and from values-aws.yaml) in
-# ONLY two dimensions — the storageClass and cloud LoadBalancer annotations.
-# Everything else is inherited from values.yaml. Do not add app logic here.
+# only three dimensions — the storageClass, cloud LoadBalancer annotations, and
+# the Secret Manager remote-key NAME (GCP forbids "/" in secret names, so the
+# key is idea-board-db here vs idea-board/db on AWS). No app logic here.
 # ---------------------------------------------------------------------------
 
 # The GKE balanced persistent-disk StorageClass.
 storageClass: standard-rwo
+
+# GCP Secret Manager secret IDs cannot contain "/", so the ESO remote key is
+# hyphenated here (the module creates secret "idea-board-db"); AWS Secrets
+# Manager allows "/" so the base value stays "idea-board/db".
+externalSecret:
+  remoteKey: idea-board-db
 
 # Cloud LoadBalancer annotations. The public LB is the ingress-nginx controller
 # Service (installed by the platform layer); these annotations are surfaced here
