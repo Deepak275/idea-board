@@ -469,25 +469,34 @@ jobs:
           # test without owning DNS, we present that Host header but --connect-to
           # the load balancer's own address — so this verifies real ingress path
           # routing whether or not INGRESS_HOST is a resolvable domain.
+          # ING_HOST is the ingress rule's host. In catch-all mode (no domain) it
+          # is intentionally EMPTY, so we hit the load balancer directly; when a
+          # real host is pinned we present it as a Host header and --connect-to
+          # the LB (works without owning DNS).
           ING_HOST=$(kubectl -n "$NAMESPACE" get ingress -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null)
           link_ok=1 LB=""
-          for i in $(seq 1 12); do
+          for i in $(seq 1 16); do
             [ -z "$LB" ] && LB=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
               -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
             [ -z "$LB" ] && LB=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
               -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
-            if [ -n "$LB" ] && [ -n "$ING_HOST" ]; then
-              api=$(curl -s -o /dev/null -w '%{http_code}' --connect-to "${ING_HOST}:80:${LB}:80" "http://${ING_HOST}/api/ideas")
-              root=$(curl -s -o /dev/null -w '%{http_code}' --connect-to "${ING_HOST}:80:${LB}:80" "http://${ING_HOST}/")
-              echo "attempt $i (LB=$LB host=$ING_HOST): /api/ideas=$api  /=$root"
+            if [ -n "$LB" ]; then
+              if [ -n "$ING_HOST" ]; then
+                api=$(curl -s -o /dev/null -w '%{http_code}' --connect-to "${ING_HOST}:80:${LB}:80" "http://${ING_HOST}/api/ideas")
+                root=$(curl -s -o /dev/null -w '%{http_code}' --connect-to "${ING_HOST}:80:${LB}:80" "http://${ING_HOST}/")
+              else
+                api=$(curl -s -o /dev/null -w '%{http_code}' "http://${LB}/api/ideas")
+                root=$(curl -s -o /dev/null -w '%{http_code}' "http://${LB}/")
+              fi
+              echo "attempt $i (LB=$LB host='${ING_HOST:-<catch-all>}'): /api/ideas=$api  /=$root"
               { [ "$api" = "200" ] && [ "$root" = "200" ]; } && { link_ok=0; break; }
             else
-              echo "attempt $i: waiting for ingress host/LB (host='${ING_HOST}' lb='${LB}')"
+              echo "attempt $i: waiting for ingress-nginx load balancer address..."
             fi
             sleep 15
           done
           echo "link_ok=$link_ok" >> "$GITHUB_OUTPUT"
-          echo "app_host=$ING_HOST" >> "$GITHUB_OUTPUT"
+          echo "app_host=${ING_HOST:-$LB}" >> "$GITHUB_OUTPUT"
           echo "lb_addr=$LB" >> "$GITHUB_OUTPUT"
 
       # ---- 6) Decide: keep, or roll back + summarise ------------------------
