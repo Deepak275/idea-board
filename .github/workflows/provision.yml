@@ -366,11 +366,10 @@ jobs:
       - name: Terraform apply — platform add-ons
         run: |
           set -e
-          # Platform state backend is per-cloud:
-          #  * AWS  -> persistent S3 (add-ons aren't recreated each run).
-          #  * GCP  -> ephemeral local state (this job has no S3 access, and the
-          #    backend block is S3-typed). Fine for a fresh cluster (add-ons don't
-          #    pre-exist); persist to GCS as the documented follow-up.
+          # Platform state is PERSISTENT on both clouds (symmetric): AWS -> S3,
+          # GCP -> GCS. The committed backend block is S3-typed and Terraform can't
+          # switch backend TYPE via -backend-config, so for GCP we swap the block to
+          # gcs with a backend OVERRIDE file, then init against the GCS bucket.
           if [ "$CLOUD" = "aws" ]; then
             terraform -chdir=infra/platform init -input=false -reconfigure \
               -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
@@ -379,7 +378,10 @@ jobs:
               -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
               -backend-config="encrypt=true"
           else
-            terraform -chdir=infra/platform init -input=false -reconfigure -backend=false
+            printf 'terraform {\n  backend "gcs" {}\n}\n' > infra/platform/zz_gcs_backend_override.tf
+            terraform -chdir=infra/platform init -input=false -reconfigure \
+              -backend-config="bucket=${{ vars.GCS_STATE_BUCKET }}" \
+              -backend-config="prefix=idea-board/gcp-platform"
           fi
 
           # Cloud-conditional ESO wiring (the only per-cloud platform inputs).
@@ -395,11 +397,9 @@ jobs:
             )
           fi
 
-          # Idempotency note: a re-apply onto already-installed add-ons can report
-          # "release already exists"; we tolerate that and continue, because the
-          # downstream app deploy + AI health-check (in deploy.yml) is the real
-          # gate — if the ClusterSecretStore is genuinely missing, the app's
-          # ExternalSecret won't sync and that gate will roll the release back.
+          # FAIL HARD on error (no masking). With persistent per-cloud state, a
+          # spurious "already exists" shouldn't occur — and masking previously hid a
+          # real backend-init failure that left the add-ons uninstalled.
           terraform -chdir=infra/platform apply -auto-approve -input=false \
             -target=terraform_data.input_guard \
             -target=helm_release.ingress_nginx \
@@ -412,5 +412,4 @@ jobs:
             -var="kube_ca_cert=${KUBE_CA}" \
             -var="kube_token=${KUBE_TOKEN}" \
             -var="letsencrypt_email=${{ vars.LETSENCRYPT_EMAIL }}" \
-            "${extra_vars[@]}" \
-          || echo "::warning::platform add-ons apply returned non-zero (add-ons may already exist); continuing — the app deploy + AI health-check in deploy.yml gates the result."
+            "${extra_vars[@]}"
