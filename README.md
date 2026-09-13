@@ -626,6 +626,34 @@ Naming these *is* part of the posture, not a footnote:
 
 ---
 
+## Per-cloud architecture (AWS & GCP)
+
+The [portable plane](#cloud-agnostic-approach) (app, Helm chart, add-ons, AI) is identical on
+both clouds; only the thin cloud-specific plane differs. The concrete realizations:
+
+| Layer | AWS | GCP |
+|---|---|---|
+| **Network** | VPC — public + private subnets, single NAT gateway | VPC — subnet with `pods`/`services` secondary ranges, Cloud NAT |
+| **Cluster** | **EKS** — managed control plane (`API_AND_CONFIG_MAP` + Access Entries), IRSA OIDC provider, managed node group | **GKE — zonal** (`<region>-a`; free control plane), Workload Identity, REGULAR channel, separate node pool |
+| **Nodes (`small`)** | `t3.medium` | `e2-medium` |
+| **Database** | **RDS PostgreSQL** — private, in-VPC | **Cloud SQL PostgreSQL** — private IP (PSA), zonal |
+| **DB secret** | **Secrets Manager** `idea-board/db` → ESO via **IRSA** | **Secret Manager** `idea-board/db` → ESO via **Workload Identity** |
+| **CI → cloud auth** | GitHub OIDC → **IAM role** (STS `AssumeRoleWithWebIdentity`) | GitHub OIDC → **Workload Identity Federation** → deploy SA |
+| **Terraform state** | **S3** + DynamoDB lock (stack + platform) | **GCS** (stack + platform) |
+| **Kubeconfig shim** | `aws eks update-kubeconfig --region <region>` | `gcloud container clusters get-credentials --location <zone>` |
+
+On top of that, **both** clusters run the byte-identical add-ons — ingress-nginx (a cloud
+LoadBalancer), cert-manager, and External Secrets Operator with the `cloud-secrets`
+ClusterSecretStore — and the same `charts/idea-board` release. The only Terraform that knows
+which cloud it is: the module *implementations* under `infra/modules/<cloud>/` (identical
+input/output contract), the per-cloud stack + backend, one ClusterSecretStore provider block,
+and the `values-<cloud>.yaml` LoadBalancer/storageClass overlay. Everything else is shared.
+
+> Live: **AWS** at the EKS LoadBalancer hostname (top of this README). **GCP** once its cluster
+> finishes provisioning (zonal GKE + Cloud SQL, on the $300 free-trial credit).
+
+---
+
 ## Repository layout
 
 ```
