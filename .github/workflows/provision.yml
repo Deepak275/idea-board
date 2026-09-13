@@ -195,7 +195,7 @@ jobs:
         env:
           TF_VAR_cloud: ${{ needs.resolve.outputs.cloud }}
           TF_VAR_region: ${{ needs.resolve.outputs.cloud == 'aws' && vars.AWS_REGION || vars.GCP_REGION }}
-          TF_VAR_project: ${{ vars.GCP_PROJECT }}
+          TF_VAR_project_id: ${{ vars.GCP_PROJECT }}
           TF_VAR_cluster_admin_principals: ${{ needs.resolve.outputs.cloud == 'aws' && format('["{0}"]', vars.AWS_DEPLOY_ROLE_ARN) || '[]' }}
         run: |
           set -e
@@ -309,7 +309,7 @@ jobs:
         env:
           TF_VAR_cloud: ${{ needs.resolve.outputs.cloud }}
           TF_VAR_region: ${{ needs.resolve.outputs.cloud == 'aws' && vars.AWS_REGION || vars.GCP_REGION }}
-          TF_VAR_project: ${{ vars.GCP_PROJECT }}
+          TF_VAR_project_id: ${{ vars.GCP_PROJECT }}
           # Grant the deploy role EKS cluster-admin via an Access Entry (AWS stack
           # only; TF ignores an undeclared TF_VAR for the GCP stack).
           TF_VAR_cluster_admin_principals: ${{ needs.resolve.outputs.cloud == 'aws' && format('["{0}"]', vars.AWS_DEPLOY_ROLE_ARN) || '[]' }}
