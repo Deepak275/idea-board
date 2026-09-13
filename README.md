@@ -257,6 +257,16 @@ provider's SKU vocabulary.
 `ai/envgen` emits only these three tokens, so AI-proposed sizing is portable by
 construction.
 
+> **The GCP cluster is *zonal*, by design (cost).** The GKE module deploys a zonal
+> cluster (`location = <region>-a`), not regional. Why: a **zonal control plane is
+> free** and runs `node_count` nodes in a single zone, whereas a **regional** control
+> plane is **billed (~$73/mo)** *and* replicates the node pool across ~3 zones (so
+> `node_count=1` becomes 3 nodes). Zonal keeps a demo comfortably inside GCP's $300
+> free trial credit. A production HA setup would use the region directly (regional) —
+> a one-line change in `infra/modules/gcp/cluster`. (AWS EKS bills its control plane
+> either way, so this trade-off is GCP-specific; the Cloud SQL instance is already
+> `ZONAL` for the same reason.)
+
 ### External Secrets Operator (ESO)
 
 The database password is **never** written into Git, Terraform state files (as plaintext),

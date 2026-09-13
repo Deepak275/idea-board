@@ -1,6 +1,6 @@
 # infra/modules/gcp/cluster/main.tf
 #
-# GCP implementation of the cross-cloud cluster contract: a regional, VPC-native
+# GCP implementation of the cross-cloud cluster contract: a ZONAL, VPC-native
 # GKE cluster with Workload Identity and a separately-managed node pool.
 #
 # t-shirt -> machine type map (GCP side of the shared vocabulary):
@@ -12,6 +12,14 @@ locals {
     medium = "e2-standard-4"
     large  = "e2-standard-8"
   }[var.node_size]
+
+  # ZONAL cluster (single zone), NOT regional — deliberate cost choice. A zonal
+  # GKE control plane is FREE and runs node_count nodes in ONE zone; a regional
+  # control plane is billed (~$0.10/hr ≈ $73/mo) AND replicates the node pool
+  # across ~3 zones (so node_count=1 becomes 3 nodes). For a cost-bounded demo
+  # that fits the $300 free credit, zonal is right; a production HA setup would
+  # use var.region directly (regional). Derive a zone from the region.
+  zone = "${var.region}-a"
 
   # Fixed secondary range names created by the network module (by convention).
   pods_range_name     = "pods"
@@ -28,7 +36,7 @@ data "google_project" "this" {}
 
 resource "google_container_cluster" "this" {
   name     = var.name
-  location = var.region
+  location = local.zone # zonal (see locals) — free control plane, single-zone nodes
 
   # Manage the node pool separately (best practice) — remove the default one.
   remove_default_node_pool = true
@@ -60,7 +68,7 @@ resource "google_container_cluster" "this" {
 
 resource "google_container_node_pool" "this" {
   name       = "${var.name}-np"
-  location   = var.region
+  location   = local.zone # match the cluster's zone (1 node pool in one zone)
   cluster    = google_container_cluster.this.name
   node_count = var.node_count
 
