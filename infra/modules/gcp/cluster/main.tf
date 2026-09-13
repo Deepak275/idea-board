@@ -42,7 +42,12 @@ resource "google_container_cluster" "this" {
   remove_default_node_pool = true
   initial_node_count       = 1
 
-  min_master_version = var.k8s_version
+  # Version is managed by the REGULAR release_channel below (GKE picks a valid,
+  # supported version). We deliberately do NOT pin min_master_version to the
+  # cross-cloud var.k8s_version: GKE rejects a version not offered in the channel
+  # (e.g. "1.33" -> "No valid versions with the prefix 1.33 found"), whereas EKS
+  # accepts an exact version. So on GCP k8s_version is advisory; to pin, set a
+  # channel-valid min_master_version here.
 
   network    = var.network.network_id
   subnetwork = var.network.subnet_ids[0]
