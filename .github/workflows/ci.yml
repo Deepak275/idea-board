@@ -1,0 +1,264 @@
+# =============================================================================
+# CI — runs on every pull request (and pushes to main).
+#
+# Gates the codebase before it can be deployed:
+#   * backend  — ruff lint + pytest (SQLite-backed, no Postgres needed)
+#   * terraform — fmt -check + validate for every root module
+#   * helm      — chart lint against both cloud overlays
+#   * explain   — AI plain-English summary of the terraform plan, posted as a
+#                 sticky PR comment (propose -> validate -> human reads it)
+#
+# No cloud mutation happens here. The only step that touches a cloud is the
+# read-only `terraform plan` in the explain job, which is gated to same-repo PRs
+# (fork PRs have no secrets/OIDC) and to repos that have opted in by setting the
+# AWS_PLAN_ROLE_ARN variable.
+# =============================================================================
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  TF_VERSION: "1.9.5"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Backend: lint + tests. The suite runs against a throwaway SQLite DB (see
+  # app/backend/tests), so no database service is required.
+  # ---------------------------------------------------------------------------
+  backend:
+    name: Backend lint & tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r app/backend/requirements-dev.txt
+          pip install ruff
+
+      - name: Ruff lint (backend + AI tooling)
+        run: python -m ruff check app/backend ai
+
+      - name: Pytest
+        working-directory: app/backend
+        run: python -m pytest -q
+
+  # ---------------------------------------------------------------------------
+  # Terraform: formatting + static validation of every root module. Uses
+  # -backend=false so no remote state / cloud creds are needed. Empty module
+  # directories (a cloud stack still being built) are skipped, not failed.
+  # ---------------------------------------------------------------------------
+  terraform:
+    name: Terraform fmt & validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive infra
+
+      - name: terraform validate (each root module)
+        run: |
+          set -e
+          status=0
+          for dir in infra/stacks/aws infra/stacks/gcp infra/platform; do
+            if [ ! -d "$dir" ] || ! ls "$dir"/*.tf >/dev/null 2>&1; then
+              echo "::notice::skipping $dir (no terraform files yet)"
+              continue
+            fi
+            echo "== validate $dir =="
+            terraform -chdir="$dir" init -backend=false -input=false >/dev/null
+            terraform -chdir="$dir" validate || status=1
+          done
+          exit $status
+
+      - name: terraform test (module unit tests, mock providers — no cloud)
+        run: |
+          set -e
+          for d in infra/modules/aws/cluster infra/modules/aws/database \
+                   infra/modules/gcp/cluster infra/modules/gcp/database; do
+            [ -d "$d/tests" ] || continue
+            echo "== terraform test $d =="
+            terraform -chdir="$d" init -backend=false -input=false >/dev/null
+            terraform -chdir="$d" test
+          done
+
+      - name: cloud-agnostic contract test
+        run: bash infra/tests/contract_parity.sh
+
+  # ---------------------------------------------------------------------------
+  # Helm: lint the chart against both cloud overlays. Skips gracefully until the
+  # chart lands (parallel build), then enforces for real.
+  # ---------------------------------------------------------------------------
+  helm:
+    name: Helm lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: helm lint (aws + gcp overlays)
+        run: |
+          if [ ! -f charts/idea-board/Chart.yaml ]; then
+            echo "::notice::charts/idea-board/Chart.yaml not present yet; skipping helm lint"
+            exit 0
+          fi
+          for cloud in aws gcp; do
+            overlay="charts/idea-board/values-${cloud}.yaml"
+            if [ -f "$overlay" ]; then
+              echo "== helm lint ($cloud) =="
+              helm lint charts/idea-board -f charts/idea-board/values.yaml -f "$overlay"
+            else
+              echo "::notice::$overlay not present; linting base values only for $cloud"
+              helm lint charts/idea-board -f charts/idea-board/values.yaml
+            fi
+          done
+
+      - name: helm-unittest (chart template unit tests)
+        run: |
+          if [ ! -d charts/idea-board/tests ]; then
+            echo "::notice::no chart unit tests yet; skipping"
+            exit 0
+          fi
+          # Helm 4 requires --verify=false to install unsigned plugins.
+          helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false
+          helm unittest charts/idea-board
+
+  # ---------------------------------------------------------------------------
+  # AI explain: run `terraform plan` (read-only) and have Claude summarise it in
+  # plain English, flagging destructive/replacement changes, as a PR comment.
+  #
+  # Guardrail: the model PROPOSES a structured {has_destructive_or_replacement,
+  # risk, summary_markdown}, ai/explain VALIDATES it against a JSON Schema, and a
+  # HUMAN reads the comment before approving the PR. Nothing is auto-applied.
+  #
+  # Gated to same-repo PRs (fork PRs cannot read secrets/OIDC) and to repos that
+  # opted in via the AWS_PLAN_ROLE_ARN variable.
+  # ---------------------------------------------------------------------------
+  explain-plan:
+    name: AI explain terraform plan
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      id-token: write # OIDC to assume the read-only plan role
+      pull-requests: write # post the explanation as a PR comment
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Install ai/explain dependencies
+        run: pip install -r ai/explain/requirements.txt
+
+      - name: Configure AWS credentials (OIDC, read-only)
+        id: awsauth
+        if: ${{ vars.AWS_PLAN_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform plan (aws stack)
+        id: plan
+        if: ${{ vars.AWS_PLAN_ROLE_ARN != '' }}
+        run: |
+          set -e
+          terraform -chdir=infra/stacks/aws init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=idea-board/aws/terraform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+          terraform -chdir=infra/stacks/aws plan -no-color -input=false \
+            -var="region=${{ vars.AWS_REGION }}" -out=tfplan
+          # Human-readable rendering of the plan -> plan.txt at the repo root.
+          terraform -chdir=infra/stacks/aws show -no-color tfplan > plan.txt
+          echo "generated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Explain the plan with Claude
+        id: explain
+        if: ${{ steps.plan.outputs.generated == 'true' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          {
+            echo "<!-- idea-board-ai-explain -->"
+            echo "## 🤖 AI plan explanation (\`infra/stacks/aws\`)"
+            echo
+            # ai/explain: propose -> validate -> print Markdown. --fail-on-destructive
+            # exits 3 so the model's *validated* boolean can surface as a warning,
+            # without hard-failing CI (a human approves the PR either way).
+            if python ai/explain/main.py -i plan.txt --fail-on-destructive; then
+              echo
+              echo "_No destructive or replacement changes detected._"
+            else
+              rc=$?
+              echo
+              if [ "$rc" = "3" ]; then
+                echo "> ⚠️ **Destructive / replacement changes detected — review carefully before merging.**"
+              else
+                echo "> _ai/explain could not produce a validated summary (exit $rc); review the plan manually._"
+              fi
+            fi
+          } > explanation.md 2>&1 || true
+          cat explanation.md
+
+      - name: Post explanation as a sticky PR comment
+        if: ${{ steps.explain.outcome == 'success' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('explanation.md', 'utf8');
+            const marker = '<!-- idea-board-ai-explain -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Note when plan/explain is skipped
+        if: ${{ vars.AWS_PLAN_ROLE_ARN == '' }}
+        run: echo "::notice::AWS_PLAN_ROLE_ARN not set; skipping AI plan explanation (configure OIDC + repo variables to enable)."

@@ -1,0 +1,32 @@
+suite: backend deployment
+templates:
+  - templates/deployment-backend.yaml
+tests:
+  - it: renders a Deployment
+    set:
+      backend.image.tag: test
+    asserts:
+      - isKind:
+          of: Deployment
+
+  - it: injects DATABASE_URL from the idea-board-db secret
+    set:
+      backend.image.tag: test
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: idea-board-db
+                key: DATABASE_URL
+
+  - it: uses the configured image repository and tag
+    set:
+      backend.image.repository: example.com/idea-board-backend
+      backend.image.tag: v9
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: example.com/idea-board-backend:v9
