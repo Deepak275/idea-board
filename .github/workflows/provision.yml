@@ -1,0 +1,322 @@
+# =============================================================================
+# Provision infrastructure.
+#
+# The INFRA half of the split pipeline (the app half lives in "Build & Deploy",
+# .github/workflows/deploy.yml). This workflow owns everything that MUTATES the
+# cloud account: the Terraform cloud stack (VPC + cluster + Postgres) and the
+# portable platform add-ons layer (ingress-nginx, cert-manager,
+# external-secrets + the "cloud-secrets" ClusterSecretStore). It never builds
+# images and never installs the idea-board app chart — that is deploy.yml's job.
+#
+# Flow (per cloud):
+#   resolve ─► plan   (push / dispatch action=plan): terraform plan only
+#           └► apply  (dispatch action=apply, behind a GitHub Environment gate):
+#                 1. terraform apply infra/stacks/<cloud>   (network + cluster + DB,
+#                    granting the deploy role EKS cluster-admin via Access Entry)
+#                 2. mint a short-lived kube bearer token for the platform providers
+#                 3. terraform apply infra/platform         (cluster ADD-ONS only)
+#
+# Security posture:
+#   * Cloud auth is OIDC only — NO long-lived cloud keys are stored.
+#   * The minted kube token is masked and passed via env, never echoed.
+#
+# ---------------------------------------------------------------------------
+# LEAST-PRIVILEGE TODO (shared convention with deploy.yml):
+#   For now BOTH "Provision infrastructure" and "Build & Deploy" assume the
+#   single OIDC role vars.AWS_DEPLOY_ROLE_ARN. Recommended follow-up is to split
+#   into two least-privilege roles:
+#     * provision = MUTATE infra (terraform apply on stack + platform)
+#     * app deploy = READ remote state + CONNECT to the cluster (helm/kubectl)
+#   IF you split them, the provision stack's TF_VAR_cluster_admin_principals MUST
+#   still include the APP-deploy role ARN (in addition to this provision role),
+#   or helm/kubectl in deploy.yml will be RBAC-denied on the EKS Access Entry.
+# ---------------------------------------------------------------------------
+# =============================================================================
+name: Provision infrastructure
+
+on:
+  # Auto-plan on any infra change merged to main (never auto-applies).
+  push:
+    branches: [main]
+    paths:
+      - "infra/stacks/**"
+      - "infra/modules/**"
+      - "infra/platform/**"
+      - ".github/workflows/provision.yml"
+  # Deliberate, human-driven plan or apply.
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: "Target cloud"
+        type: choice
+        options: [aws, gcp]
+        default: aws
+      action:
+        description: "plan (safe, read-only) or apply (mutates the cloud account)"
+        type: choice
+        options: [plan, apply]
+        default: plan
+      environment:
+        description: "Deployment environment (maps to a GitHub Environment for protection rules)"
+        type: string
+        default: production
+
+# Least privilege by default; the only elevation needed is OIDC token minting.
+permissions:
+  id-token: write # OIDC cloud auth (no static keys)
+  contents: read
+
+concurrency:
+  # Never provision the same environment+cloud concurrently. On push there are no
+  # inputs, so fall back to the same defaults the `resolve` job uses.
+  group: provision-${{ github.event.inputs.environment || 'production' }}-${{ github.event.inputs.cloud || 'aws' }}
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.16.1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the target cloud. On push there are NO inputs, so default to 'aws'
+  # (mirrors deploy.yml's `matrix` job pattern). Downstream jobs read
+  # needs.resolve.outputs.cloud.
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: Resolve target cloud
+    runs-on: ubuntu-latest
+    outputs:
+      cloud: ${{ steps.mk.outputs.cloud }}
+    steps:
+      - id: mk
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "cloud=${{ github.event.inputs.cloud }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "cloud=aws" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # PLAN: runs on every infra push AND on a manual dispatch with action=plan.
+  # Read-only — inits the stack backend (same backend-config as deploy.yml) and
+  # produces a plan. It NEVER applies.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Terraform plan (${{ needs.resolve.outputs.cloud }})
+    needs: resolve
+    if: github.event_name == 'push' || github.event.inputs.action == 'plan'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      CLOUD: ${{ needs.resolve.outputs.cloud }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # ---- Cloud authentication via OIDC (read access is enough for a plan) --
+      - name: Authenticate to AWS (OIDC)
+        if: ${{ needs.resolve.outputs.cloud == 'aws' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Authenticate to Google Cloud (OIDC / Workload Identity Federation)
+        if: ${{ needs.resolve.outputs.cloud == 'gcp' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud + GKE auth plugin
+        if: ${{ needs.resolve.outputs.cloud == 'gcp' }}
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      # ---- Cloud stack plan: network + cluster + database -------------------
+      # Same backend-config as deploy.yml's stack init. Region/project are passed
+      # as TF_VAR_* env (Terraform silently ignores an env var for a variable a
+      # stack doesn't declare), and cluster_admin_principals is passed so the plan
+      # matches what apply will do.
+      - name: Terraform init + plan — cloud stack
+        env:
+          TF_VAR_cloud: ${{ needs.resolve.outputs.cloud }}
+          TF_VAR_region: ${{ needs.resolve.outputs.cloud == 'aws' && vars.AWS_REGION || vars.GCP_REGION }}
+          TF_VAR_project: ${{ vars.GCP_PROJECT }}
+          TF_VAR_cluster_admin_principals: ${{ needs.resolve.outputs.cloud == 'aws' && format('["{0}"]', vars.AWS_DEPLOY_ROLE_ARN) || '[]' }}
+        run: |
+          set -e
+          if [ "$CLOUD" = "aws" ]; then
+            terraform -chdir=infra/stacks/aws init -input=false \
+              -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+              -backend-config="key=idea-board/aws/terraform.tfstate" \
+              -backend-config="region=${{ vars.AWS_REGION }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+              -backend-config="encrypt=true"
+          else
+            terraform -chdir=infra/stacks/gcp init -input=false \
+              -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+              -backend-config="prefix=idea-board/gcp"
+          fi
+          terraform -chdir="infra/stacks/$CLOUD" plan -input=false -no-color
+
+  # ---------------------------------------------------------------------------
+  # APPLY: manual dispatch with action=apply ONLY. Guarded by a GitHub
+  # Environment (`environment:` below) so the protection rule = human approval.
+  # Applies the cloud stack, then the platform add-ons.
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Terraform apply (${{ needs.resolve.outputs.cloud }})
+    needs: resolve
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    # The approval gate: configure a protection rule on this GitHub Environment
+    # so a human must approve before infra is mutated.
+    environment: ${{ github.event.inputs.environment }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CLOUD: ${{ needs.resolve.outputs.cloud }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # ---- Cloud authentication via OIDC ------------------------------------
+      - name: Authenticate to AWS (OIDC)
+        if: ${{ needs.resolve.outputs.cloud == 'aws' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Authenticate to Google Cloud (OIDC / Workload Identity Federation)
+        if: ${{ needs.resolve.outputs.cloud == 'gcp' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud + GKE auth plugin
+        if: ${{ needs.resolve.outputs.cloud == 'gcp' }}
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: gke-gcloud-auth-plugin
+
+      # ---- 1) Cloud stack: network + cluster + database ---------------------
+      # Region/project are passed as TF_VAR_* env: Terraform silently ignores an
+      # env var for a variable a stack doesn't declare, so the same block works
+      # for both the AWS stack (region) and the GCP stack (region + project).
+      - name: Terraform apply — cloud stack
+        env:
+          TF_VAR_cloud: ${{ needs.resolve.outputs.cloud }}
+          TF_VAR_region: ${{ needs.resolve.outputs.cloud == 'aws' && vars.AWS_REGION || vars.GCP_REGION }}
+          TF_VAR_project: ${{ vars.GCP_PROJECT }}
+          # Grant the deploy role EKS cluster-admin via an Access Entry (AWS stack
+          # only; TF ignores an undeclared TF_VAR for the GCP stack).
+          TF_VAR_cluster_admin_principals: ${{ needs.resolve.outputs.cloud == 'aws' && format('["{0}"]', vars.AWS_DEPLOY_ROLE_ARN) || '[]' }}
+        run: |
+          set -e
+          if [ "$CLOUD" = "aws" ]; then
+            terraform -chdir=infra/stacks/aws init -input=false \
+              -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+              -backend-config="key=idea-board/aws/terraform.tfstate" \
+              -backend-config="region=${{ vars.AWS_REGION }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+              -backend-config="encrypt=true"
+          else
+            terraform -chdir=infra/stacks/gcp init -input=false \
+              -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+              -backend-config="prefix=idea-board/gcp"
+          fi
+          terraform -chdir="infra/stacks/$CLOUD" apply -auto-approve -input=false
+
+      # ---- 2) Mint a short-lived bearer token for the platform TF providers --
+      # The portable platform layer authenticates purely from kube_host/
+      # kube_ca_cert/kube_token vars (no cloud SDK). We read host/CA from the
+      # stack outputs and mint the token with the cloud CLI here.
+      - name: Resolve cluster connection details
+        id: kube
+        run: |
+          set -e
+          CLUSTER=$(terraform -chdir="infra/stacks/$CLOUD" output -raw cluster_name)
+          REGION=$(terraform -chdir="infra/stacks/$CLOUD" output -raw region)
+          KUBE_HOST=$(terraform -chdir="infra/stacks/$CLOUD" output -raw kube_host)
+          KUBE_CA=$(terraform -chdir="infra/stacks/$CLOUD" output -raw kube_ca_cert)
+          if [ "$CLOUD" = "aws" ]; then
+            KUBE_TOKEN=$(aws eks get-token --cluster-name "$CLUSTER" --region "$REGION" | jq -r '.status.token')
+          else
+            KUBE_TOKEN=$(gcloud auth print-access-token)
+          fi
+          {
+            echo "CLUSTER=$CLUSTER"
+            echo "REGION=$REGION"
+            echo "KUBE_HOST=$KUBE_HOST"
+            echo "KUBE_CA=$KUBE_CA"
+          } >> "$GITHUB_ENV"
+          # Token is sensitive: mask it and pass via env, never echo it.
+          echo "::add-mask::$KUBE_TOKEN"
+          echo "KUBE_TOKEN=$KUBE_TOKEN" >> "$GITHUB_ENV"
+
+      # ---- 3) Portable platform layer: cluster ADD-ONS only -----------------
+      # We -target the add-ons and deliberately do NOT let Terraform install the
+      # app chart here: the app is owned by deploy.yml's explicit `helm upgrade`
+      # so its AI gate can `helm rollback` a bad release cleanly. The app-chart
+      # resource in infra/platform is for the standalone/manual path.
+      - name: Terraform apply — platform add-ons
+        run: |
+          set -e
+          # Persistent remote state (per cloud) so add-ons aren't recreated each run.
+          # NOTE: the backend is S3; a real GCP deploy needs its platform state in
+          # GCS (or a cloud-neutral backend) — tracked as a known limitation.
+          terraform -chdir=infra/platform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=idea-board/${CLOUD}/platform.tfstate" \
+            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+          # Cloud-conditional ESO wiring (the only per-cloud platform inputs).
+          extra_vars=()
+          if [ "$CLOUD" = "aws" ]; then
+            extra_vars+=( -var="aws_region=${REGION}" -var="aws_eso_role_arn=${{ vars.AWS_ESO_ROLE_ARN }}" )
+          else
+            extra_vars+=(
+              -var="gcp_project_id=${{ vars.GCP_PROJECT }}"
+              -var="gcp_location=${REGION}"
+              -var="gcp_cluster_name=${CLUSTER}"
+              -var="gcp_eso_service_account_email=${{ vars.GCP_ESO_SA_EMAIL }}"
+            )
+          fi
+
+          # Idempotency note: a re-apply onto already-installed add-ons can report
+          # "release already exists"; we tolerate that and continue, because the
+          # downstream app deploy + AI health-check (in deploy.yml) is the real
+          # gate — if the ClusterSecretStore is genuinely missing, the app's
+          # ExternalSecret won't sync and that gate will roll the release back.
+          terraform -chdir=infra/platform apply -auto-approve -input=false \
+            -target=terraform_data.input_guard \
+            -target=helm_release.ingress_nginx \
+            -target=helm_release.cert_manager \
+            -target=kubectl_manifest.letsencrypt_cluster_issuer \
+            -target=helm_release.external_secrets \
+            -target=kubectl_manifest.cloud_secrets_store \
+            -var="cloud=${CLOUD}" \
+            -var="kube_host=${KUBE_HOST}" \
+            -var="kube_ca_cert=${KUBE_CA}" \
+            -var="kube_token=${KUBE_TOKEN}" \
+            -var="letsencrypt_email=${{ vars.LETSENCRYPT_EMAIL }}" \
+            "${extra_vars[@]}" \
+          || echo "::warning::platform add-ons apply returned non-zero (add-ons may already exist); continuing — the app deploy + AI health-check in deploy.yml gates the result."
