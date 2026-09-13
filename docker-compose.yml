@@ -83,6 +83,34 @@ services:
     ports:
       - "5173:80"
 
+  # ---------------------------------------------------------------------------
+  # Prints the local URLs into the `docker compose up` logs once the backend is
+  # healthy, then exits (code 0). Purely informational — it blocks nothing and
+  # keeps nothing running. Without it, a plain `docker compose up` never tells
+  # you the app is on :5173 (the frontend container only knows its own :80).
+  # ---------------------------------------------------------------------------
+  urls:
+    image: busybox:1.36
+    container_name: idea-board-urls
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        echo
+        echo '=================================================='
+        echo '  Idea Board is up — open in your browser:'
+        echo '    Frontend : http://localhost:5173'
+        echo '    API      : http://localhost:8000/api/ideas'
+        echo '    Health   : http://localhost:8000/healthz'
+        echo '=================================================='
+        echo
+
 volumes:
   db-data:
     driver: local
