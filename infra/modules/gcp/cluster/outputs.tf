@@ -25,3 +25,8 @@ output "oidc_provider" {
   description = "Workload Identity pool backing GKE workload identity (PROJECT_ID.svc.id.goog) — GCP analogue of the EKS IRSA OIDC provider."
   value       = "${local.project_id}.svc.id.goog"
 }
+
+output "location" {
+  description = "Cluster location — the ZONE on GCP (cluster is zonal). Used by get-kubeconfig (--location) and the ESO ClusterSecretStore (clusterLocation)."
+  value       = local.zone
+}

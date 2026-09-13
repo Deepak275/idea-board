@@ -46,28 +46,39 @@ if [ ! -d "$STACK_DIR" ]; then
 	exit 1
 fi
 
-# Pull the two contract outputs the shim needs. -raw yields the bare string.
+# Pull the contract outputs the shim needs. -raw yields the bare string.
+# LOCATION is the cluster's actual location: the region on AWS, the ZONE on GCP
+# (the GKE cluster is zonal). REGION stays for the AWS eks call.
 CLUSTER="$("$TERRAFORM" -chdir="$STACK_DIR" output -raw cluster_name)"
 REGION="$("$TERRAFORM" -chdir="$STACK_DIR" output -raw region)"
+# LOCATION is a newer output (region on AWS, ZONE on GCP). Read tolerantly: an
+# AWS stack applied before it was added won't have it yet, and AWS uses --region
+# anyway; only the GCP path requires it.
+LOCATION="$("$TERRAFORM" -chdir="$STACK_DIR" output -raw location 2>/dev/null || true)"
 
 if [ -z "$CLUSTER" ] || [ -z "$REGION" ]; then
 	echo "error: could not read cluster_name/region from '$STACK_DIR' terraform outputs" >&2
 	exit 1
 fi
 
-echo "Configuring kubeconfig for cloud=$CLOUD cluster=$CLUSTER region=$REGION"
+echo "Configuring kubeconfig for cloud=$CLOUD cluster=$CLUSTER region=$REGION location=${LOCATION:-<none>}"
 
 case "$CLOUD" in
 aws)
 	aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
 	;;
 gcp)
-	# Regional GKE cluster (contract uses region, not zone). The gke-gcloud-auth-plugin
-	# must be installed for kubectl/helm to authenticate (CI installs it).
+	# --location accepts a zone OR a region, so this works for the zonal GKE
+	# cluster (location=<region>-a) and would also work if it were regional.
+	# The gke-gcloud-auth-plugin must be installed (CI installs it).
+	if [ -z "$LOCATION" ]; then
+		echo "error: gcp needs the 'location' stack output (the cluster zone); re-apply the stack" >&2
+		exit 1
+	fi
 	if [ -n "${GCP_PROJECT:-}" ]; then
-		gcloud container clusters get-credentials "$CLUSTER" --region "$REGION" --project "$GCP_PROJECT"
+		gcloud container clusters get-credentials "$CLUSTER" --location "$LOCATION" --project "$GCP_PROJECT"
 	else
-		gcloud container clusters get-credentials "$CLUSTER" --region "$REGION"
+		gcloud container clusters get-credentials "$CLUSTER" --location "$LOCATION"
 	fi
 	;;
 *)

@@ -34,6 +34,11 @@ output "db_secret_ref" {
   value       = module.database.db_secret_ref
 }
 
+output "location" {
+  description = "Cluster location (region on AWS)."
+  value       = module.cluster.location
+}
+
 output "oidc_provider" {
   description = "IAM OIDC provider ARN backing IRSA."
   value       = module.cluster.oidc_provider

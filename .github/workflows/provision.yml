@@ -339,6 +339,7 @@ jobs:
           set -e
           CLUSTER=$(terraform -chdir="infra/stacks/$CLOUD" output -raw cluster_name)
           REGION=$(terraform -chdir="infra/stacks/$CLOUD" output -raw region)
+          LOCATION=$(terraform -chdir="infra/stacks/$CLOUD" output -raw location)
           KUBE_HOST=$(terraform -chdir="infra/stacks/$CLOUD" output -raw kube_host)
           KUBE_CA=$(terraform -chdir="infra/stacks/$CLOUD" output -raw kube_ca_cert)
           if [ "$CLOUD" = "aws" ]; then
@@ -349,6 +350,7 @@ jobs:
           {
             echo "CLUSTER=$CLUSTER"
             echo "REGION=$REGION"
+            echo "LOCATION=$LOCATION"
             echo "KUBE_HOST=$KUBE_HOST"
             echo "KUBE_CA=$KUBE_CA"
           } >> "$GITHUB_ENV"
@@ -387,7 +389,7 @@ jobs:
           else
             extra_vars+=(
               -var="gcp_project_id=${{ vars.GCP_PROJECT }}"
-              -var="gcp_location=${REGION}"
+              -var="gcp_location=${LOCATION}"
               -var="gcp_cluster_name=${CLUSTER}"
               -var="gcp_eso_service_account_email=${{ vars.GCP_ESO_SA_EMAIL }}"
             )

@@ -33,6 +33,11 @@ output "db_secret_ref" {
   value       = module.database.db_secret_ref
 }
 
+output "location" {
+  description = "Cluster location (zone on GCP — zonal cluster)."
+  value       = module.cluster.location
+}
+
 output "oidc_provider" {
   description = "Workload Identity pool (PROJECT_ID.svc.id.goog)."
   value       = module.cluster.oidc_provider

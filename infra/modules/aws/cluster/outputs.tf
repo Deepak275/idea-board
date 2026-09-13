@@ -22,3 +22,8 @@ output "oidc_provider" {
   description = "ARN of the IAM OIDC provider backing IRSA."
   value       = aws_iam_openid_connect_provider.this.arn
 }
+
+output "location" {
+  description = "Cluster location — the region on AWS (get-kubeconfig uses --region)."
+  value       = var.region
+}
