@@ -69,3 +69,9 @@ variable "db_allowed_cidrs" {
   type        = list(string)
   default     = []
 }
+
+variable "cluster_admin_principals" {
+  description = "IAM role/user ARNs granted EKS cluster-admin via Access Entries (e.g. the CI/CD deploy role). The pipeline passes its own deploy-role ARN so helm/kubectl work."
+  type        = list(string)
+  default     = []
+}
