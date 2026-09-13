@@ -24,6 +24,33 @@ already exists) the External-Secrets IRSA role. It prints the values below.
 > re-run the pipeline. (Or, for a first URL, deploy with `externalSecret.enabled=false`
 > and inject the DB secret directly — see the AWS deploy runbook.)
 
+## 1b. GCP (one-time)
+
+GCP's bootstrap is **Terraform**, not a shell script — `infra/bootstrap/gcp` (local state,
+run once with your own gcloud creds) creates the keyless-CI plumbing symmetric to AWS:
+
+```bash
+# ADC for Terraform's google provider:
+export GOOGLE_OAUTH_ACCESS_TOKEN="$(gcloud auth print-access-token)"
+terraform -chdir=infra/bootstrap/gcp init
+terraform -chdir=infra/bootstrap/gcp apply \
+  -var="project_id=<your-gcp-project>" -var="github_repo=Deepak275/idea-board"
+terraform -chdir=infra/bootstrap/gcp output repo_variables   # the GCP_* vars to paste into GitHub
+```
+
+It provisions the **Workload Identity Federation** pool + provider (trust scoped to this
+repo — GCP's keyless-OIDC equivalent of the AWS OIDC provider), the **deploy** service
+account (with the roles CI needs), the **ESO** service account
+(`secretmanager.secretAccessor`), enables the required `google_project_service` APIs, and the
+**GCS state bucket** (`GCS_STATE_BUCKET`, used by both the stack and — via a `gcs` backend
+override `provision.yml` writes — the platform layer at `prefix=idea-board/gcp-platform`).
+
+> **ESO Workload Identity note (mirrors the AWS IRSA note):** the binding that lets the ESO
+> Kubernetes SA impersonate the ESO Google SA references the cluster's Workload Identity pool,
+> which only exists **after** the GKE cluster is created. It therefore lives in the GCP
+> *stack* (`depends_on` the cluster), not in this bootstrap — so a from-scratch GCP deploy
+> completes in a single provision run.
+
 ## 2. GitHub repo Variables & Secrets
 
 **Settings → Secrets and variables → Actions**
@@ -41,17 +68,26 @@ already exists) the External-Secrets IRSA role. It prints the values below.
 | Secret | `ANTHROPIC_API_KEY` | your Anthropic key (AI health-check / explain) |
 
 For **GCP**, set `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_DEPLOY_SERVICE_ACCOUNT`,
-`GCP_PROJECT`, `GCP_REGION`, `GCP_ESO_SA_EMAIL` (Workload Identity Federation —
-GCP's OIDC equivalent).
+`GCP_PROJECT`, `GCP_REGION`, `GCP_ESO_SA_EMAIL`, and **`GCS_STATE_BUCKET`** (the GCS bucket
+for Terraform remote state — the GCP analogue of `TF_STATE_BUCKET`, used by both the stack
+and the platform layer). All of these are printed by the §1b bootstrap's `repo_variables`
+output. Workload Identity Federation is GCP's keyless-OIDC equivalent.
 
-## 3. Deploy
+## 3. Provision, then deploy (two workflows)
 
-**Actions → Deploy → Run workflow** → pick `cloud: aws` (or `deploy_both: true`).
-The pipeline runs: **verify (lint+tests+scans)** → build+push to GHCR →
-`terraform apply` infra → get-kubeconfig → `terraform apply` platform
-(ingress-nginx, cert-manager, ESO) → `helm upgrade` → **AI health-check +
-post-deploy link check** → keep or roll back. The app URL appears in the run
-summary.
+Infra and app are **separate** pipelines so mutation is deliberate:
+
+1. **Provision** (once per cluster, or on `infra/**` changes). **Actions → Provision
+   infrastructure → Run workflow** → `cloud`, `action=apply` (a push only ever *plans*).
+   Applies the stack (network → cluster → database), then the platform add-ons (ingress-nginx,
+   cert-manager, ESO). Gated by the `production` GitHub Environment's approval rule; the
+   optional `intent` box drives AI sizing (envgen).
+2. **Deploy the app.** **Actions → Build & Deploy → Run workflow** → `cloud: aws` (or
+   `deploy_both: true` to fan out to both clouds). Runs **verify (lint+tests+scans) → build +
+   push to GHCR → read stack state + get-kubeconfig → `helm upgrade`** → **AI health-check
+   (advisory) + deterministic keep/rollback gate** (helm rollout healthy **and** the public
+   URL returns 200). The live URL appears in the run summary — it is intentionally **not**
+   committed to the repo.
 
 ## 4. Security scanning (report mode)
 

@@ -14,13 +14,12 @@ human-approved before anything runs.
   **propose → validate against JSON Schema → wait for a human → then a deterministic
   tool executes**. The LLM never runs raw commands and never sees cloud credentials.
 
-> **Live app (AWS EKS):** <http://REDACTED-LB-HOSTNAME/>
->
-> **Backend API:** <http://REDACTED-LB-HOSTNAME/api/ideas>
->
-> Served on the load balancer's own hostname — **no domain required** (the ingress runs as
-> an HTTP catch-all; set the `INGRESS_HOST` repo variable to pin a real domain + TLS).
-> Shipped by the `Build & Deploy` pipeline; the frontend calls the API **same-origin** at `/api`.
+> **Live app:** the same commit deploys to **AWS (EKS)** and **GCP (GKE)** from this repo's
+> `Build & Deploy` pipeline. Each cluster is reachable on its ingress load-balancer's own
+> hostname/IP — **no domain required** (the ingress runs as an HTTP catch-all; set the
+> `INGRESS_HOST` repo variable to pin a real domain + TLS), and the frontend calls the API
+> **same-origin** at `/api`. The live URLs are intentionally **kept out of this public repo**;
+> the pipeline prints them in its run summary.
 
 ---
 

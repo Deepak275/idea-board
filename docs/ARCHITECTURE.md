@@ -79,8 +79,10 @@ Two images, referenced everywhere by the same names with CI-substituted `OWNER`/
   every replica) guarantees exactly one migration run per release, before the new pods
   come up.
 
-Per-cloud overlays `values-aws.yaml` / `values-gcp.yaml` change only `storageClass` and
-load-balancer annotations.
+Per-cloud overlays `values-aws.yaml` / `values-gcp.yaml` change only `storageClass`,
+load-balancer annotations, and — where the cloud's secret store restricts characters — the
+ExternalSecret `remoteKey` name (GCP Secret Manager forbids `/`, so GCP uses `idea-board-db`
+while AWS keeps `idea-board/db`).
 
 ### Cluster add-ons — `infra/platform`
 
@@ -126,26 +128,45 @@ ExternalSecret "idea-board-db"  ──materializes──► K8s Secret "idea-boa
                             backend Deployment + migration Job read DATABASE_URL ◄┘
 ```
 
+> The remote-key **name** is per-store: `idea-board/db` on AWS Secrets Manager, `idea-board-db`
+> on GCP Secret Manager (which forbids `/`). ESO reads whichever the overlay's
+> `externalSecret.remoteKey` selects; the K8s Secret it materializes is `idea-board-db` either
+> way, so nothing downstream changes.
+
 The password is never committed to Git, never rendered into Helm values, and never printed
 into logs. The only components that see it are the cloud secret store, ESO, and the pods
 that actually connect to the database.
 
 ## CI/CD pipeline
 
-Two workflows under `.github/workflows`:
+**Four** workflows under `.github/workflows`, split so *mutation* is deliberate and gated
+while *validation* is fast and automatic:
 
-- **`ci.yml` (on PR):** lints, runs backend tests, `terraform fmt`/`validate`, and
-  `helm lint`. Fast feedback, no cloud access.
-- **`deploy.yml` (workflow_dispatch, inputs `cloud` + `environment`, matrix-capable):**
-  1. Build & push both images to GHCR.
-  2. `terraform -chdir=infra/stacks/$CLOUD init && apply` (network → cluster → database).
-  3. `scripts/get-kubeconfig.sh $CLOUD` — reads cluster/region from Terraform output.
-  4. `terraform apply` in `infra/platform` (add-ons).
-  5. `helm upgrade --install idea-board charts/idea-board -f values.yaml -f values-$CLOUD.yaml`.
-  6. Run `ai/healthcheck`; **exit 1 (unhealthy) → `helm rollback` + post summary.**
+- **`ci.yml` (on PR):** lint, backend tests, `terraform fmt`/`validate`, `helm lint` +
+  helm-unittest, Trivy scans, and the AI `explain-plan` job (comments a plain-English
+  `terraform plan` summary). No cloud mutation.
+- **`codeql.yml` (on PR / schedule):** CodeQL SAST for the application code.
+- **`provision.yml` — the INFRA half (mutates the cloud account).** An `infra/**` push only
+  **plans**; a `workflow_dispatch` with `action=apply` (inputs: `cloud`, `action`,
+  `environment`, optional AI `intent`) applies behind a **GitHub Environment approval gate**:
+  1. `terraform apply infra/stacks/$CLOUD` (network → cluster → database); on AWS it also
+     grants the deploy role cluster-admin via an EKS Access Entry.
+  2. mint a short-lived kube bearer token for the platform Terraform providers.
+  3. `terraform apply infra/platform` (add-ons: ingress-nginx, cert-manager, ESO + the
+     ClusterSecretStore). Platform state is per-cloud remote — **S3 on AWS, GCS on GCP**.
+- **`deploy.yml` — the APP half (never runs `terraform apply`).** `workflow_dispatch` with
+  inputs `cloud` (aws|gcp), `environment`, and `deploy_both` (matrix fan-out to both clouds):
+  1. **verify** (lint + tests + scans), then **build** both images and push to GHCR
+     (scan-before-push).
+  2. **read** the stack's remote state (never mutates it) + `scripts/get-kubeconfig.sh
+     $CLOUD` — the only cloud auth shim.
+  3. `helm upgrade --install idea-board charts/idea-board -f values.yaml -f values-$CLOUD.yaml`.
+  4. `ai/healthcheck` posts an **advisory** verdict; the **deterministic gate** — helm rollout
+     healthy **and** the public URL returns 200 — decides **keep or `helm rollback`**.
 
-Cloud auth is via **OIDC** (no static keys). `ANTHROPIC_API_KEY` is provided as a repo
-secret and is used only by the AI steps.
+Cloud auth is via **OIDC** (no static keys) on both halves. `ANTHROPIC_API_KEY` is a **soft**
+dependency: used by the AI steps **when a repo secret is present**; absent, they skip cleanly
+and the deterministic gates still make every keep/rollback call (see the README's AI section).
 
 ## AI subsystem
 
