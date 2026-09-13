@@ -204,7 +204,7 @@ jobs:
         run: |
           set -e
           terraform -chdir=infra/stacks/aws init -input=false \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=idea-board/aws/terraform.tfstate" \
             -backend-config="region=${{ vars.AWS_REGION }}" \
             -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
