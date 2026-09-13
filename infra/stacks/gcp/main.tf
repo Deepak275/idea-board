@@ -50,3 +50,18 @@ module "database" {
 
   allowed_cidrs = concat([var.vpc_cidr], var.db_allowed_cidrs)
 }
+
+# --- ESO Workload Identity binding (GCP-specific glue, post-cluster) --------
+# Binds the in-cluster External-Secrets KSA (external-secrets/external-secrets)
+# to the ESO Google SA created by the bootstrap seed. Can only exist AFTER the
+# cluster does (GKE auto-creates the <project>.svc.id.goog Workload Identity
+# pool on the first WI cluster), hence depends_on the cluster. Lives in the
+# stack — cloud-specific glue, like the EKS access entry in the AWS stack — so
+# the shared module contract stays clean. The ESO SA is named by the bootstrap.
+resource "google_service_account_iam_member" "eso_wi" {
+  service_account_id = "projects/${var.project_id}/serviceAccounts/idea-board-eso@${var.project_id}.iam.gserviceaccount.com"
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[external-secrets/external-secrets]"
+
+  depends_on = [module.cluster]
+}

@@ -65,6 +65,7 @@ resource "google_project_iam_member" "deploy" {
     "roles/compute.networkAdmin",
     "roles/secretmanager.admin",
     "roles/iam.serviceAccountUser",
+    "roles/iam.serviceAccountAdmin", # lets the pipeline set the ESO Workload-Identity binding post-cluster
     "roles/storage.admin",
     "roles/servicenetworking.networksAdmin",
   ])
@@ -92,10 +93,7 @@ resource "google_project_iam_member" "eso_secret_accessor" {
   member  = "serviceAccount:${google_service_account.eso.email}"
 }
 
-# Bind the in-cluster ESO KSA (external-secrets/external-secrets) to this GSA.
-# The KSA need not exist yet — this is just an IAM policy binding.
-resource "google_service_account_iam_member" "eso_wi" {
-  service_account_id = google_service_account.eso.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "serviceAccount:${var.project_id}.svc.id.goog[external-secrets/external-secrets]"
-}
+# NOTE: the ESO Workload-Identity binding (KSA external-secrets/external-secrets
+# -> this GSA) is NOT here — it needs the <project>.svc.id.goog pool, which GKE
+# only auto-creates once a Workload-Identity cluster exists. It's created in the
+# GCP stack (infra/stacks/gcp) with depends_on the cluster.
