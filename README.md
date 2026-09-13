@@ -134,11 +134,11 @@ shared contract — do not change them for local runs):
 |------------|-----------------------|------------------------------------------------------------------------|
 | `db`       | `5432 → 5432`         | `POSTGRES_USER=ideas`, `POSTGRES_PASSWORD=ideas`, `POSTGRES_DB=ideas`   |
 | `backend`  | `8000 → 8000`         | `DATABASE_URL=postgresql+psycopg://ideas:ideas@db:5432/ideas`           |
-| `frontend` | `80 → 80`             | `VITE_API_BASE_URL=http://localhost:8000`                               |
+| `frontend` | `5173 → 80`           | `VITE_API_BASE_URL=http://localhost:8000`                               |
 
 Then open:
 
-- **Frontend:** <http://localhost> (nginx serving the built React app)
+- **Frontend:** <http://localhost:5173> (nginx serving the built React app)
 - **Backend API:** <http://localhost:8000/api/ideas>
 - **Liveness:** <http://localhost:8000/healthz> · **Readiness:** <http://localhost:8000/readyz>
 
