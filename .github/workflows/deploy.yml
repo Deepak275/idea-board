@@ -388,7 +388,13 @@ jobs:
             --set "frontend.image.tag=${TAG}"
           )
           if [ -n "${INGRESS_HOST}" ]; then
+            # A real hostname was provided: pin the ingress to it (TLS from the
+            # chart default applies — point DNS at the LB and Let's Encrypt issues).
             args+=( --set "ingress.host=${INGRESS_HOST}" )
+          else
+            # No domain: serve as an HTTP-only catch-all so the load balancer's
+            # own hostname is a working public URL (no DNS purchase needed).
+            args+=( --set "ingress.host=" --set "ingress.tls.enabled=false" )
           fi
           helm upgrade --install "$RELEASE" charts/idea-board \
             "${args[@]}" --wait --timeout 10m

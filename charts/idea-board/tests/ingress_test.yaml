@@ -1,0 +1,43 @@
+suite: ingress host modes
+# Guards the two exposure modes:
+#  * pinned host  -> TLS + cert-manager + ssl-redirect (point DNS at the LB)
+#  * empty host   -> HTTP-only catch-all so the LB's own hostname is the URL
+#    (no domain purchase); no TLS block and no ssl-redirect that would break it.
+templates:
+  - templates/ingress.yaml
+tests:
+  - it: pins the host and enables TLS by default
+    asserts:
+      - equal:
+          path: spec.rules[0].host
+          value: idea-board.example.com
+      - equal:
+          path: spec.tls[0].hosts[0]
+          value: idea-board.example.com
+      - equal:
+          path: metadata.annotations["cert-manager.io/cluster-issuer"]
+          value: letsencrypt
+      - equal:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/ssl-redirect"]
+          value: "true"
+
+  - it: becomes an HTTP catch-all when host is empty
+    set:
+      ingress.host: ""
+      ingress.tls.enabled: false
+    asserts:
+      # No host key at all -> ingress-nginx serves the rule for any hostname
+      # (including the load balancer's own DNS name).
+      - notExists:
+          path: spec.rules[0].host
+      - notExists:
+          path: spec.tls
+      # ssl-redirect must NOT be present, or / would 308 to a non-existent cert.
+      - notExists:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/ssl-redirect"]
+      - notExists:
+          path: metadata.annotations["cert-manager.io/cluster-issuer"]
+      # General annotations still apply.
+      - equal:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/proxy-body-size"]
+          value: "16m"
