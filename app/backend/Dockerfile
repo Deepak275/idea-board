@@ -6,7 +6,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: build a self-contained virtualenv with all dependencies.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS builder
+FROM python:3.14-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -24,7 +24,7 @@ RUN pip install --upgrade pip "setuptools>=78.1.1" && pip install -r requirement
 # ---------------------------------------------------------------------------
 # Stage 2: minimal runtime image, non-root.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
