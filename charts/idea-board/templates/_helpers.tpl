@@ -117,7 +117,13 @@ http://localhost:8000
 
 {{/* Frontend API base URL (explicit value wins, else derived public URL). */}}
 {{- define "idea-board.apiBaseUrl" -}}
-{{- .Values.frontend.apiBaseUrl | default (include "idea-board.publicUrl" .) -}}
+{{- if .Values.frontend.apiBaseUrl -}}
+{{- .Values.frontend.apiBaseUrl -}}
+{{- else if .Values.ingress.enabled -}}
+{{- /* SPA + API share the ingress origin: empty base => relative /api/ideas */ -}}
+{{- else -}}
+http://localhost:8000
+{{- end -}}
 {{- end -}}
 
 {{/* Backend allowed CORS origins (explicit value wins, else derived public URL). */}}

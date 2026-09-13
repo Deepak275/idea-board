@@ -10,7 +10,10 @@
 # before launching nginx, so this file lives there.
 set -eu
 
-API_BASE_URL="${VITE_API_BASE_URL:-http://localhost:8000}"
+# Use '-' (not ':-') so an explicitly-set EMPTY value is preserved: "" means
+# same-origin (relative /api/ideas) for behind-an-ingress deploys. Only an
+# UNSET var falls back to the localhost dev default (docker-compose).
+API_BASE_URL="${VITE_API_BASE_URL-http://localhost:8000}"
 CONFIG_PATH="/usr/share/nginx/html/env-config.js"
 
 cat > "$CONFIG_PATH" <<EOF
