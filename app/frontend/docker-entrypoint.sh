@@ -20,4 +20,4 @@ cat > "$CONFIG_PATH" <<EOF
 window.__ENV__ = { VITE_API_BASE_URL: "${API_BASE_URL}" };
 EOF
 
-echo "[env-config] wrote ${CONFIG_PATH} with VITE_API_BASE_URL=${API_BASE_URL}"
+echo "[env-config] wrote ${CONFIG_PATH}: the frontend will CALL THE API at '${API_BASE_URL}' (blank = same-origin /api). This is the API URL, not the app URL."
