@@ -435,30 +435,52 @@ OIDC token, the cloud validates it against the trust policy you configured, and 
 back short-lived credentials scoped to the deploy. The LLM steps run in a separate,
 credential-free context (see [AI Integration](#ai-integration)).
 
-### Trigger it — two pipelines
+### Trigger it from the Actions UI — two pipelines
 
-**1. Provision the infra** (once per cluster, or when `infra/**` changes). Mutation is
-deliberate and approval-gated — a push only ever *plans*:
+No CLI required — both pipelines run from the repo's **Actions** tab using the grey
+**"Run workflow"** button (top-right of a workflow's page). **Deploying to AWS vs GCP is a
+single dropdown** — the `cloud` input — and nothing else about the steps changes.
 
-```bash
-# read-only plan (also runs automatically on any push touching infra/**)
-gh workflow run provision.yml -f cloud=aws -f action=plan
-# apply — pauses for approval if the "production" GitHub Environment has a required reviewer
-gh workflow run provision.yml -f cloud=aws -f action=apply -f environment=production
-```
+**1. Provision the infra** (once per cluster, or after any `infra/**` change).
 
-`provision.yml` runs `terraform apply infra/stacks/$CLOUD` (network → cluster → database,
-granting the deploy role cluster-admin via an EKS access entry) then
-`terraform apply infra/platform` (ingress-nginx, cert-manager, ESO, `cloud-secrets`).
+Go to **Actions → "Provision infrastructure" → Run workflow ▾**, pick the branch (`main`),
+and set the inputs:
 
-**2. Deploy the app** — runs automatically on any push to `app/**` or `charts/**`
-(and after a successful provision via `workflow_run`), or on demand:
+| Input         | Dry run (safe)  | Actually build it                                   |
+|---------------|-----------------|-----------------------------------------------------|
+| `cloud`       | `aws` or `gcp`  | `aws` or `gcp`                                      |
+| `action`      | `plan`          | `apply`                                             |
+| `environment` | `production`    | `production`                                        |
+| `intent`      | *(leave blank)* | *(optional)* e.g. `cost-sensitive staging` → AI sizing |
 
-```bash
-gh workflow run deploy.yml -f cloud=aws -f environment=production
-```
+- **`plan`** is read-only and never touches the cloud — and it already runs **automatically**
+  on every push that changes `infra/**`, so you rarely pick it by hand.
+- **`apply`** is the one that mutates the cloud. If the `production` GitHub Environment has a
+  required reviewer, the run **pauses at a "Review deployments" prompt** — click **Approve**
+  to let it proceed. It then runs, in order: `terraform apply infra/stacks/<cloud>` (network →
+  cluster → database; on AWS it also grants the deploy role cluster-admin via an EKS access
+  entry) → `terraform apply infra/platform` (ingress-nginx, cert-manager, ESO, the
+  `cloud-secrets` store).
+- The **`intent`** box only takes effect if an `ANTHROPIC_API_KEY` secret is set; otherwise
+  provisioning silently uses the stack's default sizing.
 
-`deploy.yml`, in order:
+**To deploy to the other cloud, run the same workflow again with `cloud` flipped.** The GCP
+run authenticates via Workload Identity Federation and keeps state in GCS; the AWS run uses an
+IAM role and S3/DynamoDB — but from the UI you just change the one dropdown.
+
+**2. Deploy the app.**
+
+Go to **Actions → "Build & Deploy" → Run workflow ▾** and set:
+
+| Input         | Value                                                                            |
+|---------------|----------------------------------------------------------------------------------|
+| `cloud`       | `aws` or `gcp`                                                                  |
+| `environment` | `production`                                                                    |
+| `deploy_both` | leave `false`; flip to **`true`** to fan out to **both** clouds in one run (a matrix that ignores `cloud`) |
+
+This pipeline also fires **automatically** on any push to `app/**` or `charts/**`, and once
+**"Provision infrastructure"** finishes successfully (a `workflow_run` redeploy onto the
+freshly (re)built cluster). However it's triggered, the run executes three jobs in order:
 
 1. **`verify`** — ruff + pytest + `terraform validate`/`test` + helm lint/unittest.
    `build` *needs* this, so a failure means **no image is ever built**.
@@ -466,10 +488,13 @@ gh workflow run deploy.yml -f cloud=aws -f environment=production
    the gate passes** (blocks on a fixable CRITICAL vuln or any leaked secret; HIGH findings
    are reported to the Security tab). *Scan before publish.*
 3. **`deploy`** — read the stack's Terraform outputs **read-only** (no `apply`, no state
-   lock) → `scripts/get-kubeconfig.sh $CLOUD` → `helm upgrade --install idea-board
-   charts/idea-board -f values.yaml -f values-$CLOUD.yaml` → **gate**: keep the release
+   lock) → `scripts/get-kubeconfig.sh <cloud>` → `helm upgrade --install idea-board
+   charts/idea-board -f values.yaml -f values-<cloud>.yaml` → **gate**: keep the release
    iff the rollout succeeded **and** the public URL returns 200 on `/` and `/api/ideas`
    (the AI health-check runs **advisory**); otherwise `helm rollback` and post a summary.
+
+**Where's my URL?** Open the finished **Build & Deploy** run → **Summary** — the deploy job
+prints the live app URL there (it's deliberately not committed to the repo).
 
 ### What actually changes between clouds
 
