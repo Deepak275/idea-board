@@ -536,6 +536,26 @@ the deterministic keep/rollback gate. Env-gen collapses "what size should stagin
 sentence with a safe, reviewable answer. Explain makes Terraform plans legible so a
 reviewer instantly sees the one line that says *replace database*.
 
+**Where each runs in the pipeline.** The three are wired into distinct stages, never on the
+critical path: `explain` in `ci.yml` (the `explain-plan` job, on PRs — comments the plan);
+`envgen` in `provision.yml` (the `intent` dispatch input — intent → validated `TF_VAR_*`
+sizing); `healthcheck` in `deploy.yml` (after `helm upgrade` — advisory verdict in the run
+summary).
+
+**Not wired here — and why that's fine.** This deployment has **no `ANTHROPIC_API_KEY`
+secret set**; the token is a *soft* dependency by design. Because AI only ever *proposes* and
+a deterministic tool decides, the pipeline is **fully functional without the model**, and each
+feature degrades safely: `healthcheck` **skips cleanly** (logs a note) and the deterministic
+gate — helm rollout success **and** the public URL returning 200 — still makes the
+keep/rollback call; `envgen` **skips** and provisioning falls back to the stack's default
+sizing; `explain` simply posts no PR comment while `terraform plan` runs unaffected. So the
+code, JSON Schemas, workflow wiring, and guardrails are all present and exercised (helm-unittest
++ CI validate the surrounding pipeline) — the only missing piece is a paid credential.
+**To activate it live**, add an `ANTHROPIC_API_KEY` repo secret (*Settings → Secrets and
+variables → Actions*); on the next runs `explain`, `healthcheck`, and `envgen` light up in
+place with nothing else changed. The key property: **correctness is identical with or without
+the key** — the AI never blocks a good deploy, waves through a bad one, or runs a raw command.
+
 Each `ai/*` directory ships its own `main` module, `requirements.txt` (`anthropic`,
 `jsonschema`), a short README, and — for health-check and env-gen — its JSON Schema.
 
