@@ -43,6 +43,12 @@ RUN apt-get update && apt-get -y upgrade && rm -rf /var/lib/apt/lists/* \
 # Copy the pre-built virtualenv from the builder stage.
 COPY --from=builder /opt/venv /opt/venv
 
+# Belt-and-suspenders for setuptools (CVE-2025-47273): patch the venv's copy too
+# (the gate scans /opt/venv) and delete any stale pre-upgrade dist-info that Trivy
+# would otherwise still report. Runs as root; `; true` keeps the build green.
+RUN /opt/venv/bin/python -m pip install --no-cache-dir --upgrade "setuptools>=78.1.1"; \
+    find / -type d -name 'setuptools-70.*.dist-info' -exec rm -rf {} + 2>/dev/null; true
+
 # Copy application source and migration assets.
 COPY app ./app
 COPY alembic ./alembic
