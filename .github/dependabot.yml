@@ -1,0 +1,72 @@
+# =============================================================================
+# Dependabot — automated dependency update PRs across every ecosystem in the
+# repo. Fills the gap Trivy leaves: Trivy *reports* vulnerable deps, Dependabot
+# *opens the fix PR* (which then runs through CI's verify gate before merge).
+#
+# Weekly cadence + grouping + PR limits keep the noise down. Nothing here blocks
+# anything — each bump is a PR a human reviews.
+# =============================================================================
+version: 2
+updates:
+  # --- Python: backend service (requirements.txt + requirements-dev.txt) ------
+  - package-ecosystem: pip
+    directory: /app/backend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      backend-python:
+        patterns: ["*"]
+
+  # --- Python: AI tooling (explain / envgen / healthcheck) --------------------
+  - package-ecosystem: pip
+    directories:
+      - /ai/explain
+      - /ai/envgen
+      - /ai/healthcheck
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      ai-python:
+        patterns: ["*"]
+
+  # --- Frontend: npm ----------------------------------------------------------
+  - package-ecosystem: npm
+    directory: /app/frontend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      frontend-npm:
+        patterns: ["*"]
+
+  # --- Docker base images (backend + frontend Dockerfiles) --------------------
+  - package-ecosystem: docker
+    directories:
+      - /app/backend
+      - /app/frontend
+    schedule:
+      interval: weekly
+
+  # --- GitHub Actions used by the workflows -----------------------------------
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # --- Terraform providers + modules (stacks, platform, all modules) ----------
+  - package-ecosystem: terraform
+    directories:
+      - /infra/stacks/aws
+      - /infra/stacks/gcp
+      - /infra/platform
+      - /infra/modules/*/*
+    schedule:
+      interval: weekly
+    groups:
+      terraform:
+        patterns: ["*"]

@@ -1,0 +1,54 @@
+# =============================================================================
+# CodeQL — static application security testing (SAST) for the app source.
+#
+# Complements the Trivy `security` job in ci.yml: Trivy finds *known-CVE deps*,
+# leaked secrets, and IaC misconfig; CodeQL analyses the *code we wrote* for
+# injection, path-traversal, SSRF, unsafe deserialization, etc. Results land in
+# the repo's Security -> Code scanning tab and annotate PRs.
+#
+# Free for public repositories. Python + the React/TS frontend are interpreted,
+# so `autobuild` is effectively a no-op (no compile step needed).
+# =============================================================================
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "27 3 * * 1" # weekly sweep (Mon 03:27 UTC) to catch newly-added rules
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload SARIF results to the Security tab
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
