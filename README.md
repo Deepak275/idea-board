@@ -14,18 +14,24 @@ human-approved before anything runs.
   **propose → validate against JSON Schema → wait for a human → then a deterministic
   tool executes**. The LLM never runs raw commands and never sees cloud credentials.
 
-> **Live URL (frontend):** `<placeholder — set after first deploy>`
+> **Live app (AWS EKS):** <http://a0153a2195c6c44ecb638ff3b4ba0dcb-1786836222.us-east-1.elb.amazonaws.com/>
 >
-> **Live URL (backend API):** `<placeholder — set after first deploy>`
+> **Backend API:** <http://a0153a2195c6c44ecb638ff3b4ba0dcb-1786836222.us-east-1.elb.amazonaws.com/api/ideas>
+>
+> Served on the load balancer's own hostname — **no domain required** (the ingress runs as
+> an HTTP catch-all; set the `INGRESS_HOST` repo variable to pin a real domain + TLS).
+> Shipped by the `Build & Deploy` pipeline; the frontend calls the API **same-origin** at `/api`.
 
 ---
 
 ## Table of contents
 
 - [Architecture](#architecture)
+- [CI/CD pipelines](#cicd-pipelines)
 - [Run locally with Docker Compose](#run-locally-with-docker-compose)
 - [Deploy to a cloud](#deploy-to-a-cloud)
 - [AI Integration](#ai-integration)
+- [Security: how we build and deploy safely](#security-how-we-build-and-deploy-safely)
 - [Cloud-Agnostic Approach](#cloud-agnostic-approach)
 - [Repository layout](#repository-layout)
 - [Further reading](#further-reading)
@@ -42,19 +48,17 @@ provider knowledge is allowed to live.
 ```
                           ┌──────────────────────────────────────────────────────────┐
                           │                    GitHub Actions CI/CD                    │
-                          │   .github/workflows/{ci.yml, deploy.yml}                   │
+                          │  ci.yml · codeql.yml · provision.yml · deploy.yml          │
+                          │  (full flowchart + dependencies: see "CI/CD pipelines")    │
                           │                                                            │
-   PR ──► ci.yml ─────────┤  lint • backend tests • terraform fmt/validate • helm lint │
+   PR / push ──► CI+CodeQL┤  lint • tests • tf validate/test • helm • Trivy fs • SAST  │
                           │                                                            │
-   dispatch(cloud) ──────►│  deploy.yml:                                               │
-                          │   1. build+push images ──► GHCR                            │
-                          │   2. terraform apply infra/stacks/$CLOUD (network/cluster/ │
-                          │      database)                                             │
-                          │   3. scripts/get-kubeconfig.sh $CLOUD  (the ONLY cloud shim)│
-                          │   4. terraform apply infra/platform  (cluster add-ons)     │
-                          │   5. helm upgrade --install idea-board                     │
-                          │        -f values.yaml -f values-$CLOUD.yaml                │
-                          │   6. python -m ai.healthcheck  ── unhealthy? ─► helm rollback│
+   infra push /dispatch ─►│  provision.yml: tf PLAN on push · tf APPLY when approved   │
+                          │    stacks/$CLOUD (VPC+cluster+DB)  +  infra/platform add-ons│
+                          │                                                            │
+   app push /dispatch ───►│  deploy.yml:  verify ─► build(scan-before-push) ─► deploy: │
+                          │    read tf outputs ─► get-kubeconfig ─► helm upgrade ─►     │
+                          │    AI health-check (advisory) + link-check ─► keep/rollback │
                           └───────────────────────────┬──────────────────────────────┘
                                                        │  kubeconfig + OIDC (no static keys)
                                                        ▼
@@ -101,6 +105,74 @@ provider knowledge is allowed to live.
 
 A deeper narrative — data flow, request lifecycle, and the reasoning behind each
 boundary — lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+---
+
+## CI/CD pipelines
+
+Delivery is split into **four workflows** so that *infrastructure* changes (rare, costly,
+stateful) and *application* changes (frequent, idempotent) have separate lifecycles, blast
+radii, and triggers. Infra is only ever **planned** automatically and **applied** behind a
+human approval gate; the app pipeline never touches infra — it only *reads* the stack's
+remote state.
+
+```mermaid
+flowchart TD
+    prMain["PR / push to main"]:::t
+    pInfra["push · infra/stacks, modules, platform"]:::t
+    pApp["push · app or charts"]:::t
+    disp["workflow_dispatch (manual)"]:::t
+
+    subgraph ALWAYS["Always-on checks — every push and PR"]
+        ci["ci.yml — ruff, pytest, terraform fmt/validate/test, contract parity, helm lint + unittest, Trivy fs (secret/vuln/misconfig)"]
+        cq["codeql.yml — SAST for python and JS/TS, results to the Security tab"]
+    end
+    prMain --> ci
+    prMain --> cq
+
+    subgraph PROV["Provision infrastructure — provision.yml (mutates the cloud)"]
+        pRes["resolve — pick cloud (defaults aws on push)"]
+        pPlan["plan — terraform plan on the stack (READ-ONLY)"]
+        pApply["apply — GitHub Environment APPROVAL gate"]
+        pStack["terraform apply infra/stacks/CLOUD<br/>VPC + cluster + Postgres + EKS access entry"]
+        pAdd["terraform apply infra/platform<br/>ingress-nginx, cert-manager, ESO, ClusterSecretStore"]
+        pRes --> pPlan
+        pRes --> pApply
+        pApply --> pStack --> pAdd
+    end
+    pInfra -->|plan only| pPlan
+    disp -->|action = plan or apply| pRes
+
+    subgraph DEP["Build and Deploy — deploy.yml (app only, never applies infra)"]
+        dVer["verify — ruff, pytest, terraform validate/test, helm lint + unittest"]
+        dBuild["build (needs: verify)<br/>1. build image LOCALLY (not pushed)<br/>2. Trivy SARIF report to Security tab (HIGH + CRITICAL)<br/>3. GATE — block on CRITICAL vuln or any leaked secret<br/>4. push to GHCR"]
+        dMat["resolve deploy matrix (clouds)"]
+        dDep["deploy (needs: verify, build, matrix)<br/>1. terraform output (READ-ONLY — no apply, no lock)<br/>2. scripts/get-kubeconfig.sh<br/>3. helm upgrade --install<br/>4. AI health-check ADVISORY + link-check (/ and /api/ideas = 200)<br/>5. keep OR helm rollback"]
+        dVer --> dBuild --> dDep
+        dMat --> dDep
+    end
+    pApp --> dVer
+    disp --> dVer
+    pAdd -.->|workflow_run on success| dVer
+
+    classDef t fill:#eef,stroke:#77a,color:#000;
+```
+
+**Job dependencies & the checks that gate each step**
+
+| Workflow | Trigger | Jobs (dependency) | Gate / check |
+|---|---|---|---|
+| `ci.yml` | every push to `main` + every PR | `backend`, `terraform`, `helm`, `security`, `explain-plan` (parallel) | ruff + pytest; `tf fmt/validate` + `terraform test` + contract parity; helm lint + unittest; Trivy fs (secret **blocks**, vuln/misconfig report); AI plan-explain on PRs |
+| `codeql.yml` | push/PR + weekly | `analyze` (matrix: python, js-ts) | SAST → Security tab |
+| `provision.yml` | push on `infra/**` → **plan**; dispatch `action=apply` → **apply** | `resolve` → `plan`; `resolve` → `apply` | `apply` is `needs: resolve` (not `plan`) and sits behind a **GitHub Environment** approval; push can only reach `plan` |
+| `deploy.yml` | push on `app/**`,`charts/**`; dispatch; `workflow_run` after provision | `verify` → `build` → `deploy`; `matrix` → `deploy` | **`build` needs `verify`** (no image is built unless lint/tests/tf/helm pass); **scan-before-push** gate inside `build`; **deploy** gate = helm rollout OK **and** public URL returns 200 (AI health-check is advisory) → else `helm rollback` |
+
+Key design choices: **path filters** route infra vs app pushes to the right workflow;
+`terraform apply` on a cluster never runs on a bare push (plan-only + approved apply);
+the deploy job **reads** stack outputs instead of applying them, so an app release never
+holds the infra state lock or needs infra-mutating IAM. Setup details (OIDC, repo
+variables/secrets, the Environment gate) are in
+[`docs/PIPELINE_SETUP.md`](docs/PIPELINE_SETUP.md).
 
 ---
 
@@ -166,9 +238,11 @@ To tear everything down and reclaim the volume: `make down` (or `docker compose 
 
 ## Deploy to a cloud
 
-Deployment is driven entirely by the GitHub Actions workflow
-[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml). You pick a cloud, it does
-the rest. The pipeline is the same for AWS and GCP; only a single `cloud` input changes.
+Deployment is driven by two GitHub Actions workflows —
+[`provision.yml`](.github/workflows/provision.yml) (infra) and
+[`deploy.yml`](.github/workflows/deploy.yml) (app) — see [CI/CD pipelines](#cicd-pipelines)
+for the full flowchart. You pick a cloud; the pipelines do the rest. They are the same for
+AWS and GCP; only a single `cloud` input changes.
 
 ### Prerequisites (one-time)
 
@@ -185,7 +259,9 @@ the rest. The pipeline is the same for AWS and GCP; only a single `cloud` input 
    READMEs for the partial-backend config):
    - **AWS:** an S3 bucket + a DynamoDB table for state locking.
    - **GCP:** a GCS bucket.
-5. **Repo secret** `ANTHROPIC_API_KEY` for the AI health-check step.
+5. **Repo secret** `ANTHROPIC_API_KEY` — **optional.** The AI health-check is *advisory*
+   (the deterministic gate = healthy rollout + a live 200 from the public URL), so the app
+   deploys fine without a key; provide one to enable the AI health verdict + PR plan-explain.
 
 ### Credentials via OIDC
 
@@ -195,30 +271,41 @@ OIDC token, the cloud validates it against the trust policy you configured, and 
 back short-lived credentials scoped to the deploy. The LLM steps run in a separate,
 credential-free context (see [AI Integration](#ai-integration)).
 
-### Trigger a deploy
+### Trigger it — two pipelines
 
-From the GitHub UI: **Actions → Deploy → Run workflow**, then choose:
-
-- **`cloud`**: `aws` or `gcp`
-- **`environment`**: e.g. `staging` or `production`
-
-Or from the CLI:
+**1. Provision the infra** (once per cluster, or when `infra/**` changes). Mutation is
+deliberate and approval-gated — a push only ever *plans*:
 
 ```bash
-gh workflow run deploy.yml -f cloud=aws -f environment=staging
+# read-only plan (also runs automatically on any push touching infra/**)
+gh workflow run provision.yml -f cloud=aws -f action=plan
+# apply — pauses for approval if the "production" GitHub Environment has a required reviewer
+gh workflow run provision.yml -f cloud=aws -f action=apply -f environment=production
 ```
 
-What the pipeline does, in order (all defined in `deploy.yml`):
+`provision.yml` runs `terraform apply infra/stacks/$CLOUD` (network → cluster → database,
+granting the deploy role cluster-admin via an EKS access entry) then
+`terraform apply infra/platform` (ingress-nginx, cert-manager, ESO, `cloud-secrets`).
 
-1. Build & push `idea-board-backend` and `idea-board-frontend` images to GHCR.
-2. `terraform -chdir=infra/stacks/$CLOUD init && … apply` — creates network → cluster → database.
-3. `scripts/get-kubeconfig.sh $CLOUD` — the **only** cloud-specific auth shim; it reads
-   the cluster name/region from Terraform outputs and writes a kubeconfig.
-4. `terraform apply` against [`infra/platform`](infra/platform) — installs ingress-nginx,
-   cert-manager, External Secrets Operator, and the `cloud-secrets` ClusterSecretStore.
-5. `helm upgrade --install idea-board charts/idea-board -f values.yaml -f values-$CLOUD.yaml`.
-6. Run the AI health-check (`python -m ai.healthcheck`). **Exit 0 = healthy, exit 1 =
-   unhealthy → the workflow runs `helm rollback` and posts a summary.**
+**2. Deploy the app** — runs automatically on any push to `app/**` or `charts/**`
+(and after a successful provision via `workflow_run`), or on demand:
+
+```bash
+gh workflow run deploy.yml -f cloud=aws -f environment=production
+```
+
+`deploy.yml`, in order:
+
+1. **`verify`** — ruff + pytest + `terraform validate`/`test` + helm lint/unittest.
+   `build` *needs* this, so a failure means **no image is ever built**.
+2. **`build`** — build the images **locally**, Trivy-scan them, and **push to GHCR only if
+   the gate passes** (blocks on a fixable CRITICAL vuln or any leaked secret; HIGH findings
+   are reported to the Security tab). *Scan before publish.*
+3. **`deploy`** — read the stack's Terraform outputs **read-only** (no `apply`, no state
+   lock) → `scripts/get-kubeconfig.sh $CLOUD` → `helm upgrade --install idea-board
+   charts/idea-board -f values.yaml -f values-$CLOUD.yaml` → **gate**: keep the release
+   iff the rollout succeeded **and** the public URL returns 200 on `/` and `/api/ideas`
+   (the AI health-check runs **advisory**); otherwise `helm rollback` and post a summary.
 
 ### What actually changes between clouds
 
@@ -257,7 +344,7 @@ ran `terraform destroy`" downside. The AI is an advisor, never an operator.
 
 | Feature | Path | Model | Input | Output (schema-validated) | Who acts |
 |---------|------|-------|-------|---------------------------|----------|
-| **Health-check** | [`ai/healthcheck`](ai/healthcheck) | `claude-sonnet-5` | rollout status, pod restart counts, `kubectl get events`, recent backend/frontend logs (gathered via `kubectl` subprocess) | `{healthy: bool, confidence: 0-1, reasons: [str], summary: str}` | **CI gates on exit code.** 0 healthy, 1 unhealthy → automatic `helm rollback`. |
+| **Health-check** | [`ai/healthcheck`](ai/healthcheck) | `claude-sonnet-5` | rollout status, pod restart counts, `kubectl get events`, recent backend/frontend logs (gathered via `kubectl` subprocess) | `{healthy: bool, confidence: 0-1, reasons: [str], summary: str}` | **Advisory.** Emits a structured verdict to the run summary; the **deterministic** gate (healthy rollout **+** public URL returns 200) decides keep/rollback. Skipped cleanly when no `ANTHROPIC_API_KEY` is set. |
 | **Env-gen** | [`ai/envgen`](ai/envgen) | `claude-opus-5` | an intent string, e.g. `"cost-sensitive staging"` or `"high-availability production"` | `{node_size (small\|medium\|large), node_count, backend_replicas, frontend_replicas, hpa_min, hpa_max}` — constrained to the t-shirt vocabulary with hard min/max guardrails | **Human.** Renders a tfvars + Helm values snippet and prints it for approval. Never auto-applies. |
 | **Explain** | [`ai/explain`](ai/explain) | `claude-sonnet-5` | `terraform plan` output or a `helm diff` | plain-English summary that **flags destructive / replacement changes** | **Human.** Posted as a PR comment in CI (or printed locally). |
 
@@ -271,19 +358,86 @@ into a safe, bounded config benefits from stronger reasoning.
   doesn't validate is a hard failure, not a "best effort" parse.
 - Env-gen additionally clamps to a hard min/max envelope, so even a valid-looking but
   reckless suggestion (e.g. `node_count: 500`) is rejected.
-- The health-check's authority is *bounded*: it can trigger a rollback (a safe, reversible
-  action) but cannot invent new commands.
+- The health-check is *advisory and bounded*: it reports a verdict but does **not** gate the
+  release — the deterministic checks (helm rollout success + a live 200 from the public URL)
+  make the keep/rollback call, so a wrong or unavailable AI answer can never block a good
+  deploy (or wave through a broken one).
 - Credentials never reach the model. `ANTHROPIC_API_KEY` is read from the environment;
   cloud creds live only in the OIDC-scoped deploy steps.
 
 **Tangible value.** The health-check turns "did the deploy actually work?" from a human
-squinting at `kubectl` output into an automatic, explainable gate that rolls back bad
-releases on its own. Env-gen collapses "what size should staging be?" into an intent
+squinting at `kubectl` output into an automatic, explainable verdict that rides alongside
+the deterministic keep/rollback gate. Env-gen collapses "what size should staging be?" into an intent
 sentence with a safe, reviewable answer. Explain makes Terraform plans legible so a
 reviewer instantly sees the one line that says *replace database*.
 
 Each `ai/*` directory ships its own `main` module, `requirements.txt` (`anthropic`,
 `jsonschema`), a short README, and — for health-check and env-gen — its JSON Schema.
+
+---
+
+## Security: how we build and deploy safely
+
+Security is applied in **layers, at every stage** — source → dependencies → build → deploy →
+runtime — and wherever practical it *gates* (blocks the pipeline) rather than merely
+reporting. Each table maps a **practice → the tool → the use case (threat it stops) → where
+it's enforced**. Everything below is real and in the repo today.
+
+### Source & development-time
+
+| Practice | Tool | Use case — the threat it stops | Enforcement |
+|---|---|---|---|
+| **Secret scanning** | Trivy `fs --scanners secret` | Committing an API key / DB password / token into a public repo | **Blocks** CI (`ci.yml` `security` job) |
+| **SAST (static code analysis)** | CodeQL (python + JS/TS) | Injection, SSRF, path traversal, unsafe deserialization in *our* code | `codeql.yml` → Security tab (push/PR/weekly) |
+| **Dependency CVE scan** | Trivy `fs --scanners vuln` | Depending on a library with a known exploit | CI → Security tab |
+| **Automated dependency updates** | Dependabot (pip · npm · docker · actions · terraform) | Drifting onto stale/vulnerable deps; slow patching | Weekly grouped PRs (terraform **major** bumps ignored — they need a deliberate migration) |
+| **IaC / container / K8s misconfig** | Trivy `fs --scanners misconfig` | An open security group, a root container, a missing probe baked into Terraform/Dockerfile/chart | CI |
+| **Quality gate before build** | `verify` job — ruff · pytest · `terraform test` · helm-unittest | Shipping code that doesn't lint, fails tests, or renders broken manifests | **`build` needs `verify`** — no image is built if it fails |
+| **Infra correctness tests** | `terraform test` (mock providers) + contract-parity test | A module change that breaks the cloud-agnostic contract or the sizing map | CI + `verify` |
+
+### Build & supply-chain
+
+| Practice | Tool | Use case | Enforcement |
+|---|---|---|---|
+| **Scan *before* publish** | Trivy `image` (build locally → scan → push) | A vulnerable image reaching the registry / a cluster | **Blocks the push** on a fixable CRITICAL vuln or any leaked secret; HIGH → Security tab |
+| **Base-image patching** | `apt-get upgrade` / `apk upgrade`, `setuptools` bump | Shipping known OS/language CVEs inherited from the base image | In the Dockerfiles; re-verified by the gate above |
+| **Non-root containers** | dedicated unprivileged user (backend); nginx uid 101 + `setcap` (frontend) | Container-breakout / privilege-escalation blast radius | Baked into the images |
+| **Deterministic, traceable tags** | `sha-<gitsha>` image tags | "which commit is actually running?" — provenance | Every build |
+| **Keyless registry auth** | GHCR + the workflow's built-in `GITHUB_TOKEN` | Long-lived registry credentials to steal | No PAT stored |
+
+### Deploy & runtime
+
+| Practice | Tool | Use case | Enforcement |
+|---|---|---|---|
+| **Keyless cloud auth (OIDC)** | GitHub OIDC → AWS STS / GCP WIF | Stolen long-lived cloud access keys | **No static cloud keys** anywhere — short-lived per-run credentials |
+| **Secrets out of Git/state/values** | External Secrets Operator + cloud secret store (IRSA / Workload Identity) | DB password leaking via Git, Terraform state, or Helm values | ESO syncs `idea-board/db` into a runtime-only K8s Secret |
+| **Encrypted, locked remote state** | S3 (SSE) + DynamoDB lock | State tampering, concurrent-apply corruption, secrets-in-state exposure | Terraform backends |
+| **Account-ID masking in public logs** | `TF_STATE_BUCKET` stored as a GitHub **Secret** | Leaking the AWS account ID (embedded in the bucket name) into public Actions logs | Masked secret, not a plain variable |
+| **Human approval before infra mutation** | GitHub **Environment** protection on `provision.yml` `apply` | An accidental/malicious push destroying a cluster or DB | A push can only *plan*; *apply* waits for a reviewer |
+| **Declarative least-privilege cluster access** | EKS Access Entries (`API_AND_CONFIG_MAP`) | Broad, unmanaged, imperative `aws-auth` cluster admin | Deploy role granted admin in Terraform (2-role split is the documented next step) |
+| **Deterministic deploy gate + auto-rollback** | helm `--wait` rollout + post-deploy link check (`/` and `/api/ideas` = 200) | A broken or unreachable release staying live | Non-200 or failed rollout → automatic `helm rollback` |
+| **Branch protection** | Repo ruleset | Force-deletion of `main` | Deletion blocked |
+| **TLS termination** | cert-manager + Let's Encrypt (when a domain is set) | Plaintext traffic / MITM | ClusterIssuer in `infra/platform` |
+
+### AI safety (the pipeline is AI-assisted)
+
+The AI features follow **propose → schema-validate → deterministic action**: Claude never
+receives cloud credentials or Kubernetes Secrets, never executes raw commands, and — for the
+health-check — **never gates** the release (it's advisory). See [AI Integration](#ai-integration).
+
+### Honest gaps (deliberately deferred)
+
+Naming these *is* part of the posture, not a footnote:
+
+- **The push gate blocks on CRITICAL + secrets, not every HIGH.** Blocking every fixable HIGH
+  in transitive/base-image deps is an unsustainable treadmill; HIGH is reported to the Security
+  tab for triage. Tighten to HIGH once the base images are on a clean patch cadence.
+- **One broad deploy IAM role** is shared by provision and deploy; the least-privilege 2-role
+  split (provision = mutate, app = read-state + connect) is documented in both workflows.
+- **Trivy `vuln`/`misconfig` are report-mode in `ci.yml`** (the secret scan blocks). Flip to
+  blocking once the first run's findings are triaged.
+- **No image signing / provenance attestation** (cosign / SLSA) yet, and **no runtime
+  NetworkPolicy / Pod Security enforcement** in the chart yet.
 
 ---
 
@@ -476,13 +630,20 @@ idea-board/
 │   ├── envgen/                  # CLI; intent → constrained config; *.schema.json
 │   └── explain/                 # CLI; plan/diff → plain-English, flags destructive
 ├── scripts/
-│   └── get-kubeconfig.sh        # POSIX sh; the ONLY cloud-specific auth shim
-├── .github/workflows/
-│   ├── ci.yml                   # PR: lint + backend tests + tf fmt/validate + helm lint
-│   └── deploy.yml               # dispatch: build → tf → kubeconfig → platform → helm → AI
+│   ├── get-kubeconfig.sh        # POSIX sh; the ONLY cloud-specific auth shim
+│   ├── bootstrap-aws.sh         # one-time: S3 state bucket + DynamoDB lock table
+│   └── bootstrap-aws-oidc.sh    # one-time: GitHub OIDC provider + deploy/ESO IAM roles
+├── .github/
+│   ├── workflows/
+│   │   ├── ci.yml               # push/PR: ruff + pytest + tf fmt/validate/test + helm + Trivy fs
+│   │   ├── codeql.yml           # push/PR/weekly: SAST (python + JS/TS) → Security tab
+│   │   ├── provision.yml        # infra: tf PLAN on push · gated tf APPLY (stacks + platform)
+│   │   └── deploy.yml           # app: verify → build (scan-before-push) → deploy + gate/rollback
+│   └── dependabot.yml           # weekly grouped dep-update PRs (pip/npm/docker/actions/terraform)
 ├── docs/
 │   ├── ARCHITECTURE.md          # deeper architecture narrative
-│   └── ADDING_A_CLOUD.md        # step-by-step 3rd-cloud (Azure) guide
+│   ├── ADDING_A_CLOUD.md        # step-by-step 3rd-cloud (Azure) guide
+│   └── PIPELINE_SETUP.md        # OIDC + repo variables/secrets + Environment gate setup
 ├── docker-compose.yml           # db + backend + frontend for local dev
 ├── .env.example                 # documented env template
 ├── Makefile                     # up, down, logs, test, tf-init, deploy, destroy, lint
