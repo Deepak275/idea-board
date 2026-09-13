@@ -428,7 +428,7 @@ jobs:
               -backend-config="encrypt=true"
           else
             terraform -chdir=infra/stacks/gcp init -input=false \
-              -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+              -backend-config="bucket=${{ vars.GCS_STATE_BUCKET }}" \
               -backend-config="prefix=idea-board/gcp"
           fi
           # The two contract outputs later steps + get-kubeconfig.sh consume.

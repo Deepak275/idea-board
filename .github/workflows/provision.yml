@@ -208,7 +208,7 @@ jobs:
               -backend-config="encrypt=true"
           else
             terraform -chdir=infra/stacks/gcp init -input=false \
-              -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+              -backend-config="bucket=${{ vars.GCS_STATE_BUCKET }}" \
               -backend-config="prefix=idea-board/gcp"
           fi
           terraform -chdir="infra/stacks/$CLOUD" plan -input=false -no-color
@@ -324,7 +324,7 @@ jobs:
               -backend-config="encrypt=true"
           else
             terraform -chdir=infra/stacks/gcp init -input=false \
-              -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+              -backend-config="bucket=${{ vars.GCS_STATE_BUCKET }}" \
               -backend-config="prefix=idea-board/gcp"
           fi
           terraform -chdir="infra/stacks/$CLOUD" apply -auto-approve -input=false
@@ -364,15 +364,21 @@ jobs:
       - name: Terraform apply — platform add-ons
         run: |
           set -e
-          # Persistent remote state (per cloud) so add-ons aren't recreated each run.
-          # NOTE: the backend is S3; a real GCP deploy needs its platform state in
-          # GCS (or a cloud-neutral backend) — tracked as a known limitation.
-          terraform -chdir=infra/platform init -input=false -reconfigure \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=idea-board/${CLOUD}/platform.tfstate" \
-            -backend-config="region=${{ vars.AWS_REGION }}" \
-            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
-            -backend-config="encrypt=true"
+          # Platform state backend is per-cloud:
+          #  * AWS  -> persistent S3 (add-ons aren't recreated each run).
+          #  * GCP  -> ephemeral local state (this job has no S3 access, and the
+          #    backend block is S3-typed). Fine for a fresh cluster (add-ons don't
+          #    pre-exist); persist to GCS as the documented follow-up.
+          if [ "$CLOUD" = "aws" ]; then
+            terraform -chdir=infra/platform init -input=false -reconfigure \
+              -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+              -backend-config="key=idea-board/aws/platform.tfstate" \
+              -backend-config="region=${{ vars.AWS_REGION }}" \
+              -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+              -backend-config="encrypt=true"
+          else
+            terraform -chdir=infra/platform init -input=false -reconfigure -backend=false
+          fi
 
           # Cloud-conditional ESO wiring (the only per-cloud platform inputs).
           extra_vars=()
