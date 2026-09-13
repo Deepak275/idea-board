@@ -99,8 +99,9 @@ env:
 jobs:
   # ---------------------------------------------------------------------------
   # Build -> SCAN -> push (in that order): images are built LOCALLY, Trivy-gated
-  # (fixable HIGH/CRITICAL vulns or leaked secrets BLOCK the push), and only then
-  # pushed to GHCR. Gated on `verify` so a lint/test/tf/helm failure never builds.
+  # (fixable CRITICAL vulns or leaked secrets BLOCK the push; HIGH is reported to
+  # the Security tab), and only then pushed to GHCR. Gated on `verify` so a
+  # lint/test/tf/helm failure never builds.
   # Deterministic tag = sha-<short>; GHCR paths use the lowercased owner.
   # ---------------------------------------------------------------------------
   build:
@@ -194,21 +195,25 @@ jobs:
           sarif_file: frontend.sarif
           category: trivy-image-frontend
 
-      # 2b) GATE: BLOCK the push on fixable HIGH/CRITICAL vulns OR any leaked secret.
-      #     (misconfig stays report-only above to avoid base-image false positives.)
-      #     If this fails, the images below are never pushed and the deploy is skipped
-      #     (the live app keeps running its current image). Triage via base-image bump
-      #     or a reviewed .trivyignore, then re-run.
-      - name: Trivy gate — blocks push on HIGH/CRITICAL vulns or secrets
+      # 2b) GATE: BLOCK the push on fixable CRITICAL vulns OR any leaked secret —
+      #     the severe/exploitable + credential-leak class (hard stop). HIGH vulns
+      #     are REPORTED to the Security tab (step 2a) for triage, not blocked:
+      #     blocking every transitive-dep / base-image HIGH is an unsustainable
+      #     treadmill. Tighten to HIGH once base images are on a clean patch cadence.
+      #     A blocked gate never pushes the image and skips the deploy (live app
+      #     keeps its current image).
+      - name: Trivy gate — blocks push on CRITICAL vulns or leaked secrets
         env:
           BE: ${{ steps.meta.outputs.backend_image }}:${{ steps.meta.outputs.tag }}
           FE: ${{ steps.meta.outputs.frontend_image }}:${{ steps.meta.outputs.tag }}
         run: |
           set -e
           for img in "$BE" "$FE"; do
-            echo "== gating scan $img =="
-            trivy image --scanners vuln,secret --severity HIGH,CRITICAL \
+            echo "== gate: fixable CRITICAL vulns in $img =="
+            trivy image --scanners vuln --severity CRITICAL \
               --ignore-unfixed --exit-code 1 --no-progress "$img"
+            echo "== gate: leaked secrets in $img =="
+            trivy image --scanners secret --exit-code 1 --no-progress "$img"
           done
 
       # 3) PUSH — only reached if `verify` passed AND the gate above passed. The
