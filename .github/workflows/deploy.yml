@@ -118,7 +118,7 @@ jobs:
       backend_image: ${{ steps.meta.outputs.backend_image }}
       frontend_image: ${{ steps.meta.outputs.frontend_image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compute image coordinates
         id: meta
@@ -133,10 +133,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -145,7 +145,7 @@ jobs:
       # 1) BUILD LOCALLY (load into the runner's docker) — do NOT push yet, so a
       #    vulnerable image never reaches the registry.
       - name: Build backend image (local, not pushed)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: app/backend
           push: false
@@ -155,7 +155,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=backend
 
       - name: Build frontend image (local, not pushed)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: app/frontend
           push: false
@@ -182,7 +182,7 @@ jobs:
       - name: Upload backend image findings to the Security tab
         if: ${{ always() && hashFiles('backend.sarif') != '' }}
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: backend.sarif
           category: trivy-image-backend
@@ -190,7 +190,7 @@ jobs:
       - name: Upload frontend image findings to the Security tab
         if: ${{ always() && hashFiles('frontend.sarif') != '' }}
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: frontend.sarif
           category: trivy-image-frontend
@@ -219,7 +219,7 @@ jobs:
       # 3) PUSH — only reached if `verify` passed AND the gate above passed. The
       #    layers are cache-hits from the local build, so this is a near-instant push.
       - name: Push backend image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: app/backend
           push: true
@@ -230,7 +230,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=backend
 
       - name: Push frontend image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: app/frontend
           push: true
@@ -250,15 +250,15 @@ jobs:
     # stops the image from being built or pushed (not just the deploy).
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: v4.3.0
       - name: Backend lint + tests
@@ -361,28 +361,28 @@ jobs:
       # event we pin to the SHA provisioning ran against. For push / dispatch the
       # expression is empty, which makes actions/checkout fall back to its default
       # (the ref that triggered the run).
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
       - name: Set up Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v4.3.0 # pinned to match local
 
       - name: Set up kubectl
-        uses: azure/setup-kubectl@v4
+        uses: azure/setup-kubectl@v5
 
       - name: Install AI health-check dependencies
         run: pip install -r ai/healthcheck/requirements.txt
@@ -390,21 +390,21 @@ jobs:
       # ---- Cloud authentication via OIDC ------------------------------------
       - name: Authenticate to AWS (OIDC)
         if: ${{ matrix.cloud == 'aws' }}
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Authenticate to Google Cloud (OIDC / Workload Identity Federation)
         if: ${{ matrix.cloud == 'gcp' }}
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
       - name: Set up gcloud + GKE auth plugin
         if: ${{ matrix.cloud == 'gcp' }}
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
         with:
           install_components: gke-gcloud-auth-plugin
 
